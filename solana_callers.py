@@ -10,8 +10,11 @@ import csv
 import sys
 from datetime import datetime, timezone, timedelta
 
+import os
+from pathlib import Path
+
 import aiohttp
-from twscrape import API as TwscrapeAPI
+from twikit import Client
 
 
 # ── Step 1: Get pump timestamp from DexScreener ─────────────────────────
@@ -70,40 +73,109 @@ def parse_pump_timestamp(data: dict) -> tuple[datetime, datetime]:
 
 # ── Step 2: Scrape X for early tweets mentioning the CA ─────────────────
 
-async def scrape_tweets(ca: str, window_start: datetime, window_end: datetime) -> list[dict]:
-    """
-    Search X for tweets containing the CA within the time window.
+COOKIES_FILE = "cookies.json"
 
-    twscrape requires pre-added & logged-in accounts stored in its SQLite DB.
-    Run `twscrape add_accounts` beforehand — see twscrape docs.
-    """
-    api = TwscrapeAPI()
 
-    since_str = window_start.strftime("%Y-%m-%d_%H:%M:%S_UTC")
-    until_str = window_end.strftime("%Y-%m-%d_%H:%M:%S_UTC")
+async def get_twikit_client() -> Client:
+    """
+    Authenticate with X via twikit.
+
+    On first run, logs in with credentials from environment variables and saves
+    cookies.  On subsequent runs, reuses the saved cookies file.
+
+    Required env vars (first run only):
+      X_USERNAME, X_EMAIL, X_PASSWORD
+    """
+    client = Client(language="en-US")
+
+    if Path(COOKIES_FILE).exists():
+        client.load_cookies(COOKIES_FILE)
+        print("[twikit] Loaded saved cookies.")
+        return client
+
+    username = os.environ.get("X_USERNAME")
+    email = os.environ.get("X_EMAIL")
+    password = os.environ.get("X_PASSWORD")
+    if not all([username, email, password]):
+        sys.exit(
+            "First run requires X credentials.\n"
+            "Set env vars: X_USERNAME, X_EMAIL, X_PASSWORD"
+        )
+
+    print("[twikit] Logging in...")
+    await client.login(
+        auth_info_1=username,
+        auth_info_2=email,
+        password=password,
+    )
+    client.save_cookies(COOKIES_FILE)
+    print("[twikit] Login successful, cookies saved.")
+    return client
+
+
+def _parse_tweet_time(raw: str) -> datetime:
+    """Parse the timestamp string returned by twikit into a tz-aware datetime."""
+    # twikit returns format like "Wed Oct 10 20:19:24 +0000 2018"
+    try:
+        dt = datetime.strptime(raw, "%a %b %d %H:%M:%S %z %Y")
+    except (ValueError, TypeError):
+        dt = datetime.now(tz=timezone.utc)
+    return dt
+
+
+async def scrape_tweets(
+    client: Client,
+    ca: str,
+    window_start: datetime,
+    window_end: datetime,
+    max_tweets: int = 200,
+) -> list[dict]:
+    """
+    Search X for tweets containing the CA within the time window using twikit.
+    """
+    since_str = window_start.strftime("%Y-%m-%d")
+    until_str = (window_end + timedelta(days=1)).strftime("%Y-%m-%d")
     query = f"{ca} since:{since_str} until:{until_str}"
 
     print(f"\nSearching X: {query}")
 
     tweets: list[dict] = []
     try:
-        async for tweet in api.search(query, limit=200):
-            tweet_time = tweet.date
-            if tweet_time.tzinfo is None:
-                tweet_time = tweet_time.replace(tzinfo=timezone.utc)
+        results = await client.search_tweet(query, product="Latest", count=20)
 
-            tweets.append({
-                "username": tweet.user.username,
-                "followers": tweet.user.followersCount,
-                "tweet_time": tweet_time.isoformat(),
-                "tweet_time_dt": tweet_time,
-                "likes": tweet.likeCount,
-                "retweets": tweet.retweetCount,
-                "tweet_url": f"https://x.com/{tweet.user.username}/status/{tweet.id}",
-            })
+        while results and len(tweets) < max_tweets:
+            for tweet in results:
+                tweet_time = _parse_tweet_time(tweet.created_at)
+
+                # Filter to exact window
+                if tweet_time < window_start or tweet_time > window_end:
+                    continue
+
+                tweets.append({
+                    "username": tweet.user.screen_name,
+                    "followers": tweet.user.followers_count,
+                    "tweet_time": tweet_time.isoformat(),
+                    "tweet_time_dt": tweet_time,
+                    "likes": tweet.favorite_count,
+                    "retweets": tweet.retweet_count,
+                    "tweet_url": f"https://x.com/{tweet.user.screen_name}/status/{tweet.id}",
+                })
+
+            # Paginate — rate-limit guard with backoff
+            if len(tweets) >= max_tweets:
+                break
+            try:
+                await asyncio.sleep(1)  # gentle rate-limit pause
+                results = await results.next()
+            except Exception:
+                break
+
     except Exception as exc:
-        print(f"[twscrape] Error during search: {exc}")
-        print("Make sure you have added & logged in accounts via `twscrape add_accounts`.")
+        print(f"[twikit] Error during search: {exc}")
+        print(
+            "Make sure cookies.json exists or X_USERNAME / X_EMAIL / X_PASSWORD "
+            "env vars are set."
+        )
 
     print(f"Collected {len(tweets)} tweets in window.")
     return tweets
@@ -178,9 +250,10 @@ async def main() -> None:
     created_at, pump_peak = parse_pump_timestamp(dex_data)
 
     # Step 2 — Scrape X
+    client = await get_twikit_client()
     window_start = created_at - timedelta(hours=1)
     window_end = pump_peak + timedelta(minutes=30)
-    tweets = await scrape_tweets(ca, window_start, window_end)
+    tweets = await scrape_tweets(client, ca, window_start, window_end)
 
     if not tweets:
         print("No tweets found. Exiting.")
