@@ -14,7 +14,10 @@ import os
 from pathlib import Path
 
 import aiohttp
+from dotenv import load_dotenv
 from twikit import Client
+
+load_dotenv()
 
 
 # ── Step 1: Get pump timestamp from DexScreener ─────────────────────────
