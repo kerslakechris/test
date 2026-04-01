@@ -290,29 +290,19 @@ def print_top(rows: list[dict], n: int = 5) -> None:
 # ── Main ─────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Find influential X callers for a Solana token before its pump."
-    )
-    subparsers = parser.add_subparsers(dest="command")
-
-    # Sub-command: setup-cookies
-    subparsers.add_parser(
-        "setup-cookies",
-        help="Import browser cookies to cookies.json (bypasses login)",
-    )
-
-    # Default (positional) usage
-    parser.add_argument("ca", nargs="?", help="Solana token contract address")
-    parser.add_argument("-o", "--output", default="callers.csv", help="Output CSV path (default: callers.csv)")
-    parser.add_argument("--top", type=int, default=5, help="Number of top callers to print (default: 5)")
-    args = parser.parse_args()
-
-    if args.command == "setup-cookies":
+    # Handle setup-cookies before argparse so it doesn't conflict with positional CA
+    if len(sys.argv) >= 2 and sys.argv[1] == "setup-cookies":
         setup_cookies_interactive()
         return
 
-    if not args.ca:
-        parser.error("the following arguments are required: ca")
+    parser = argparse.ArgumentParser(
+        description="Find influential X callers for a Solana token before its pump.",
+        epilog="Run 'python solana_callers.py setup-cookies' to import browser cookies.",
+    )
+    parser.add_argument("ca", help="Solana token contract address")
+    parser.add_argument("-o", "--output", default="callers.csv", help="Output CSV path (default: callers.csv)")
+    parser.add_argument("--top", type=int, default=5, help="Number of top callers to print (default: 5)")
+    args = parser.parse_args()
 
     ca: str = args.ca
 
