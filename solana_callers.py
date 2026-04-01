@@ -34,7 +34,16 @@ Then run:
 
 # ── Twitter GraphQL search (direct, no twikit) ──────────────────────────
 
-TWITTER_SEARCH_URL = "https://x.com/i/api/graphql/flaR-PUMshxFWZWPNpq4zA/SearchTimeline"
+# X rotates GraphQL query IDs every few weeks.  We try several known IDs
+# in order.  Override with the TWITTER_SEARCH_QID env var if they all break.
+SEARCH_QUERY_IDS = [
+    os.environ.get("TWITTER_SEARCH_QID", ""),  # user override (highest priority)
+    "flaR-PUMshxFWZWPNpq4zA",
+    "4fpceYZ6-YQCx_JSl_Cn_A",
+    "MJpyQGqgklrVl_0X9gNy3A",
+]
+SEARCH_QUERY_IDS = [qid for qid in SEARCH_QUERY_IDS if qid]
+TWITTER_SEARCH_BASE = "https://x.com/i/api/graphql/{qid}/SearchTimeline"
 
 SEARCH_FEATURES = {
     "rweb_tipjar_consumption_enabled": True,
@@ -97,6 +106,44 @@ def build_cookie_header(cookies: dict) -> str:
     return "; ".join(f"{k}={v}" for k, v in cookies.items())
 
 
+async def _try_search_request(
+    session: aiohttp.ClientSession,
+    url: str,
+    headers: dict,
+) -> tuple[int, dict | None]:
+    """Make a single search request, return (status_code, json_or_None)."""
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            if resp.status == 200:
+                return 200, await resp.json()
+            return resp.status, None
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return 0, None
+
+
+async def _resolve_search_qid(
+    session: aiohttp.ClientSession,
+    params_qs: str,
+    headers: dict,
+) -> str:
+    """Try each known query ID and return the first one that doesn't 404."""
+    for qid in SEARCH_QUERY_IDS:
+        url = f"{TWITTER_SEARCH_BASE.format(qid=qid)}?{params_qs}"
+        status, _ = await _try_search_request(session, url, headers)
+        if status != 404:
+            print(f"[X API] Using query ID: {qid}")
+            return qid
+        print(f"[X API] Query ID {qid} returned 404, trying next...")
+    sys.exit(
+        "[X API] All known GraphQL query IDs returned 404.\n"
+        "X has rotated the endpoint. Find the current ID in browser DevTools:\n"
+        "  1. Go to x.com and search for anything\n"
+        "  2. Open DevTools → Network → filter 'SearchTimeline'\n"
+        "  3. Copy the query ID from the URL\n"
+        "  4. Set: export TWITTER_SEARCH_QID=<the_id>\n"
+    )
+
+
 async def twitter_search(
     session: aiohttp.ClientSession,
     query: str,
@@ -106,6 +153,21 @@ async def twitter_search(
     """Search Twitter via GraphQL API and return parsed tweet dicts."""
     headers = build_twitter_headers(cookies)
     headers["Cookie"] = build_cookie_header(cookies)
+
+    # Build initial params to probe for a working query ID
+    probe_variables = {
+        "rawQuery": query,
+        "count": 20,
+        "querySource": "typed_query",
+        "product": "Latest",
+    }
+    probe_params = urllib.parse.urlencode({
+        "variables": json.dumps(probe_variables),
+        "features": json.dumps(SEARCH_FEATURES),
+    })
+
+    qid = await _resolve_search_qid(session, probe_params, headers)
+    search_url = TWITTER_SEARCH_BASE.format(qid=qid)
 
     tweets: list[dict] = []
     cursor = None
@@ -125,7 +187,7 @@ async def twitter_search(
             "features": json.dumps(SEARCH_FEATURES),
         }
 
-        url = f"{TWITTER_SEARCH_URL}?{urllib.parse.urlencode(params)}"
+        url = f"{search_url}?{urllib.parse.urlencode(params)}"
 
         for attempt in range(4):
             try:
