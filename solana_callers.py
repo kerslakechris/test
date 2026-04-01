@@ -7,16 +7,15 @@ before or during its initial price pump.
 import argparse
 import asyncio
 import csv
-import sys
-from datetime import datetime, timezone, timedelta
-
 import json
 import os
+import sys
+import urllib.parse
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import aiohttp
 from dotenv import load_dotenv
-from twikit import Client
 
 load_dotenv()
 
@@ -32,6 +31,213 @@ To export cookies from your browser:
 Then run:
   python solana_callers.py setup-cookies
 """
+
+# ── Twitter GraphQL search (direct, no twikit) ──────────────────────────
+
+TWITTER_SEARCH_URL = "https://x.com/i/api/graphql/MJpyQGqgklrVl_0X9gNy3A/SearchTimeline"
+
+SEARCH_FEATURES = {
+    "rweb_tipjar_consumption_enabled": True,
+    "responsive_web_graphql_exclude_directive_enabled": True,
+    "verified_phone_label_enabled": False,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "communities_web_enable_tweet_community_results_featuring": True,
+    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+    "articles_preview_enabled": True,
+    "responsive_web_edit_tweet_api_enabled": True,
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+    "view_counts_everywhere_api_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
+    "responsive_web_twitter_article_tweet_consumption_enabled": True,
+    "tweet_awards_web_tipping_enabled": False,
+    "creator_subscriptions_quote_tweet_preview_enabled": False,
+    "freedom_of_speech_not_reach_fetch_enabled": True,
+    "standardized_nudges_misinfo": True,
+    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+    "rweb_video_timestamps_enabled": True,
+    "longform_notetweets_rich_text_read_enabled": True,
+    "longform_notetweets_inline_media_enabled": True,
+    "responsive_web_enhance_cards_enabled": False,
+}
+
+
+def load_cookies() -> dict:
+    """Load cookies from cookies.json."""
+    if not Path(COOKIES_FILE).exists():
+        sys.exit(
+            f"No {COOKIES_FILE} found.\n"
+            "Run: python solana_callers.py setup-cookies\n\n"
+            + BROWSER_COOKIE_HELP
+        )
+    with open(COOKIES_FILE) as f:
+        cookies = json.load(f)
+    if not cookies.get("auth_token") or not cookies.get("ct0"):
+        sys.exit("cookies.json must contain 'auth_token' and 'ct0'.")
+    return cookies
+
+
+def build_twitter_headers(cookies: dict) -> dict:
+    """Build headers for Twitter's GraphQL API."""
+    return {
+        "authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
+        "x-csrf-token": cookies["ct0"],
+        "x-twitter-auth-type": "OAuth2Session",
+        "x-twitter-active-user": "yes",
+        "x-twitter-client-language": "en",
+        "content-type": "application/json",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Referer": "https://x.com/search",
+    }
+
+
+def build_cookie_header(cookies: dict) -> str:
+    """Format cookies dict as a Cookie header string."""
+    return "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+
+async def twitter_search(
+    session: aiohttp.ClientSession,
+    query: str,
+    cookies: dict,
+    max_tweets: int = 200,
+) -> list[dict]:
+    """Search Twitter via GraphQL API and return parsed tweet dicts."""
+    headers = build_twitter_headers(cookies)
+    headers["Cookie"] = build_cookie_header(cookies)
+
+    tweets: list[dict] = []
+    cursor = None
+
+    for page in range(10):  # max 10 pages
+        variables = {
+            "rawQuery": query,
+            "count": 20,
+            "querySource": "typed_query",
+            "product": "Latest",
+        }
+        if cursor:
+            variables["cursor"] = cursor
+
+        params = {
+            "variables": json.dumps(variables),
+            "features": json.dumps(SEARCH_FEATURES),
+        }
+
+        url = f"{TWITTER_SEARCH_URL}?{urllib.parse.urlencode(params)}"
+
+        for attempt in range(4):
+            try:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    if resp.status == 429:
+                        wait = 2 ** (attempt + 1)
+                        print(f"[X API] Rate-limited, retrying in {wait}s...")
+                        await asyncio.sleep(wait)
+                        continue
+                    if resp.status == 401:
+                        sys.exit(
+                            "[X API] 401 Unauthorized — cookies are expired.\n"
+                            "Re-run: python solana_callers.py setup-cookies"
+                        )
+                    resp.raise_for_status()
+                    data = await resp.json()
+                    break
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                wait = 2 ** (attempt + 1)
+                print(f"[X API] Request error ({exc}), retrying in {wait}s...")
+                await asyncio.sleep(wait)
+        else:
+            print("[X API] Failed after retries, stopping pagination.")
+            break
+
+        # Parse response
+        new_tweets, cursor = _parse_search_response(data)
+        tweets.extend(new_tweets)
+
+        if not cursor or len(tweets) >= max_tweets:
+            break
+
+        await asyncio.sleep(1)  # rate-limit pause between pages
+
+    return tweets[:max_tweets]
+
+
+def _parse_search_response(data: dict) -> tuple[list[dict], str | None]:
+    """Extract tweets and next cursor from GraphQL search response."""
+    tweets = []
+    next_cursor = None
+
+    try:
+        instructions = (
+            data.get("data", {})
+            .get("search_by_raw_query", {})
+            .get("search_timeline", {})
+            .get("timeline", {})
+            .get("instructions", [])
+        )
+    except (AttributeError, TypeError):
+        return tweets, None
+
+    for instruction in instructions:
+        entries = instruction.get("entries", [])
+        for entry in entries:
+            # Cursor entries
+            if entry.get("entryId", "").startswith("cursor-bottom"):
+                next_cursor = (
+                    entry.get("content", {})
+                    .get("value")
+                    or entry.get("content", {})
+                    .get("itemContent", {})
+                    .get("value")
+                )
+                continue
+
+            # Tweet entries
+            result = (
+                entry.get("content", {})
+                .get("itemContent", {})
+                .get("tweet_results", {})
+                .get("result", {})
+            )
+            if not result:
+                continue
+
+            # Handle tweets wrapped in "tweet" key (tombstoned/limited tweets)
+            if "tweet" in result:
+                result = result["tweet"]
+
+            core = result.get("core", {}).get("user_results", {}).get("result", {})
+            legacy_user = core.get("legacy", {})
+            legacy_tweet = result.get("legacy", {})
+
+            if not legacy_tweet or not legacy_user:
+                continue
+
+            screen_name = legacy_user.get("screen_name", "")
+            tweet_id = legacy_tweet.get("id_str", result.get("rest_id", ""))
+
+            # Parse timestamp
+            created_str = legacy_tweet.get("created_at", "")
+            try:
+                tweet_time = datetime.strptime(created_str, "%a %b %d %H:%M:%S %z %Y")
+            except (ValueError, TypeError):
+                continue
+
+            tweets.append({
+                "username": screen_name,
+                "followers": legacy_user.get("followers_count", 0),
+                "tweet_time": tweet_time.isoformat(),
+                "tweet_time_dt": tweet_time,
+                "likes": legacy_tweet.get("favorite_count", 0),
+                "retweets": legacy_tweet.get("retweet_count", 0),
+                "tweet_url": f"https://x.com/{screen_name}/status/{tweet_id}",
+            })
+
+    return tweets, next_cursor
+
+
+# ── Step 1: Get pump timestamp from DexScreener ─────────────────────────
 
 async def fetch_dexscreener_data(session: aiohttp.ClientSession, ca: str) -> dict:
     """Fetch token pair data from DexScreener and identify the pump timestamp."""
@@ -85,58 +291,11 @@ def parse_pump_timestamp(data: dict) -> tuple[datetime, datetime]:
     return created_at, pump_peak
 
 
-# ── Step 2: Scrape X for early tweets mentioning the CA ─────────────────
-
-async def get_twikit_client() -> Client:
-    """
-    Authenticate with X via twikit.
-
-    Authentication methods (tried in order):
-      1. Load existing cookies.json (no login needed).
-      2. Log in with env vars X_USERNAME, X_EMAIL, X_PASSWORD and save cookies.
-
-    If login fails, use 'setup-cookies' to import cookies from your browser.
-    """
-    client = Client(language="en-US")
-
-    if Path(COOKIES_FILE).exists():
-        client.load_cookies(COOKIES_FILE)
-        print("[twikit] Loaded saved cookies.")
-        return client
-
-    username = os.environ.get("X_USERNAME")
-    email = os.environ.get("X_EMAIL")
-    password = os.environ.get("X_PASSWORD")
-    if not all([username, email, password]):
-        sys.exit(
-            "No cookies.json found and X credentials not set.\n"
-            "Either:\n"
-            "  1. Set env vars X_USERNAME, X_EMAIL, X_PASSWORD (in .env) and re-run\n"
-            "  2. Run: python solana_callers.py setup-cookies  (import browser cookies)\n"
-        )
-
-    print("[twikit] Logging in...")
-    try:
-        await client.login(
-            auth_info_1=username,
-            auth_info_2=email,
-            password=password,
-        )
-    except Exception as exc:
-        sys.exit(
-            f"[twikit] Login failed: {exc}\n\n"
-            "X is blocking programmatic login. Import browser cookies instead:\n"
-            "  python solana_callers.py setup-cookies\n\n"
-            + BROWSER_COOKIE_HELP
-        )
-    client.save_cookies(COOKIES_FILE)
-    print("[twikit] Login successful, cookies saved.")
-    return client
-
+# ── Step 2: Scrape X ────────────────────────────────────────────────────
 
 def setup_cookies_interactive() -> None:
     """
-    Import cookies from the browser and write cookies.json for twikit.
+    Import cookies from the browser and write cookies.json.
 
     Prompts for auth_token and ct0 (required), plus optional cookies.
     """
@@ -170,72 +329,30 @@ def setup_cookies_interactive() -> None:
     print("You can now run: python solana_callers.py <CA>")
 
 
-def _parse_tweet_time(raw: str) -> datetime:
-    """Parse the timestamp string returned by twikit into a tz-aware datetime."""
-    # twikit returns format like "Wed Oct 10 20:19:24 +0000 2018"
-    try:
-        dt = datetime.strptime(raw, "%a %b %d %H:%M:%S %z %Y")
-    except (ValueError, TypeError):
-        dt = datetime.now(tz=timezone.utc)
-    return dt
-
-
 async def scrape_tweets(
-    client: Client,
+    session: aiohttp.ClientSession,
+    cookies: dict,
     ca: str,
     window_start: datetime,
     window_end: datetime,
-    max_tweets: int = 200,
 ) -> list[dict]:
-    """
-    Search X for tweets containing the CA within the time window using twikit.
-    """
+    """Search X for tweets containing the CA within the time window."""
     since_str = window_start.strftime("%Y-%m-%d")
     until_str = (window_end + timedelta(days=1)).strftime("%Y-%m-%d")
     query = f"{ca} since:{since_str} until:{until_str}"
 
     print(f"\nSearching X: {query}")
 
-    tweets: list[dict] = []
-    try:
-        results = await client.search_tweet(query, product="Latest", count=20)
+    tweets = await twitter_search(session, query, cookies)
 
-        while results and len(tweets) < max_tweets:
-            for tweet in results:
-                tweet_time = _parse_tweet_time(tweet.created_at)
+    # Filter to exact time window
+    filtered = [
+        t for t in tweets
+        if window_start <= t["tweet_time_dt"] <= window_end
+    ]
 
-                # Filter to exact window
-                if tweet_time < window_start or tweet_time > window_end:
-                    continue
-
-                tweets.append({
-                    "username": tweet.user.screen_name,
-                    "followers": tweet.user.followers_count,
-                    "tweet_time": tweet_time.isoformat(),
-                    "tweet_time_dt": tweet_time,
-                    "likes": tweet.favorite_count,
-                    "retweets": tweet.retweet_count,
-                    "tweet_url": f"https://x.com/{tweet.user.screen_name}/status/{tweet.id}",
-                })
-
-            # Paginate — rate-limit guard with backoff
-            if len(tweets) >= max_tweets:
-                break
-            try:
-                await asyncio.sleep(1)  # gentle rate-limit pause
-                results = await results.next()
-            except Exception:
-                break
-
-    except Exception as exc:
-        print(f"[twikit] Error during search: {exc}")
-        print(
-            "Make sure cookies.json exists or X_USERNAME / X_EMAIL / X_PASSWORD "
-            "env vars are set."
-        )
-
-    print(f"Collected {len(tweets)} tweets in window.")
-    return tweets
+    print(f"Collected {len(filtered)} tweets in window.")
+    return filtered
 
 
 # ── Step 3: Score callers ────────────────────────────────────────────────
@@ -305,18 +422,18 @@ async def main() -> None:
     args = parser.parse_args()
 
     ca: str = args.ca
+    cookies = load_cookies()
+    print("[X] Loaded cookies.")
 
-    # Step 1 — DexScreener
     async with aiohttp.ClientSession() as session:
+        # Step 1 — DexScreener
         dex_data = await fetch_dexscreener_data(session, ca)
+        created_at, pump_peak = parse_pump_timestamp(dex_data)
 
-    created_at, pump_peak = parse_pump_timestamp(dex_data)
-
-    # Step 2 — Scrape X
-    client = await get_twikit_client()
-    window_start = created_at - timedelta(hours=1)
-    window_end = pump_peak + timedelta(minutes=30)
-    tweets = await scrape_tweets(client, ca, window_start, window_end)
+        # Step 2 — Scrape X
+        window_start = created_at - timedelta(hours=1)
+        window_end = pump_peak + timedelta(minutes=30)
+        tweets = await scrape_tweets(session, cookies, ca, window_start, window_end)
 
     if not tweets:
         print("No tweets found. Exiting.")
