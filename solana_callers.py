@@ -83,11 +83,12 @@ async def get_twikit_client() -> Client:
     """
     Authenticate with X via twikit.
 
-    On first run, logs in with credentials from environment variables and saves
-    cookies.  On subsequent runs, reuses the saved cookies file.
+    Authentication methods (tried in order):
+      1. Load existing cookies.json (no login needed).
+      2. Log in with env vars X_USERNAME, X_EMAIL, X_PASSWORD and save cookies.
 
-    Required env vars (first run only):
-      X_USERNAME, X_EMAIL, X_PASSWORD
+    If login fails (e.g. "Couldn't get KEY_BYTE indices"), you can bootstrap
+    cookies manually — see the setup-cookies sub-command.
     """
     client = Client(language="en-US")
 
@@ -101,19 +102,51 @@ async def get_twikit_client() -> Client:
     password = os.environ.get("X_PASSWORD")
     if not all([username, email, password]):
         sys.exit(
-            "First run requires X credentials.\n"
-            "Set env vars: X_USERNAME, X_EMAIL, X_PASSWORD"
+            "No cookies.json found and X credentials not set.\n"
+            "Either:\n"
+            "  1. Set env vars X_USERNAME, X_EMAIL, X_PASSWORD (in .env) and re-run\n"
+            "  2. Run: python solana_callers.py setup-cookies  (interactive login)\n"
         )
 
     print("[twikit] Logging in...")
+    try:
+        await client.login(
+            auth_info_1=username,
+            auth_info_2=email,
+            password=password,
+        )
+    except Exception as exc:
+        sys.exit(
+            f"[twikit] Login failed: {exc}\n\n"
+            "This often happens when X temporarily blocks login attempts.\n"
+            "Fix: run 'python solana_callers.py setup-cookies' to log in interactively,\n"
+            "or wait a while and retry."
+        )
+    client.save_cookies(COOKIES_FILE)
+    print("[twikit] Login successful, cookies saved.")
+    return client
+
+
+async def interactive_login() -> None:
+    """
+    Interactive cookie bootstrap — prompts for credentials, saves cookies.json.
+    Useful when automated login hits X's rate-limit / KEY_BYTE error.
+    """
+    client = Client(language="en-US")
+
+    username = input("X username: ").strip()
+    email = input("X email: ").strip()
+    password = input("X password: ").strip()
+
+    print("[twikit] Attempting login...")
     await client.login(
         auth_info_1=username,
         auth_info_2=email,
         password=password,
     )
     client.save_cookies(COOKIES_FILE)
-    print("[twikit] Login successful, cookies saved.")
-    return client
+    print(f"[twikit] Login successful — cookies saved to {COOKIES_FILE}")
+    print("You can now run the main script without re-authenticating.")
 
 
 def _parse_tweet_time(raw: str) -> datetime:
@@ -239,10 +272,26 @@ async def main() -> None:
     parser = argparse.ArgumentParser(
         description="Find influential X callers for a Solana token before its pump."
     )
-    parser.add_argument("ca", help="Solana token contract address")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # Sub-command: setup-cookies
+    subparsers.add_parser(
+        "setup-cookies",
+        help="Interactively log in to X and save cookies.json",
+    )
+
+    # Default (positional) usage
+    parser.add_argument("ca", nargs="?", help="Solana token contract address")
     parser.add_argument("-o", "--output", default="callers.csv", help="Output CSV path (default: callers.csv)")
     parser.add_argument("--top", type=int, default=5, help="Number of top callers to print (default: 5)")
     args = parser.parse_args()
+
+    if args.command == "setup-cookies":
+        await interactive_login()
+        return
+
+    if not args.ca:
+        parser.error("the following arguments are required: ca")
 
     ca: str = args.ca
 
