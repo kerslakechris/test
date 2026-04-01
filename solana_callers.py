@@ -10,6 +10,7 @@ import csv
 import sys
 from datetime import datetime, timezone, timedelta
 
+import json
 import os
 from pathlib import Path
 
@@ -19,8 +20,18 @@ from twikit import Client
 
 load_dotenv()
 
+COOKIES_FILE = "cookies.json"
 
-# ── Step 1: Get pump timestamp from DexScreener ─────────────────────────
+BROWSER_COOKIE_HELP = """\
+To export cookies from your browser:
+  1. Log in to x.com in your browser.
+  2. Open DevTools (F12) → Application → Cookies → https://x.com
+  3. Copy the values of these cookies: auth_token, ct0
+  4. (Optional but recommended) Also copy: kdt, twid, guest_id
+
+Then run:
+  python solana_callers.py setup-cookies
+"""
 
 async def fetch_dexscreener_data(session: aiohttp.ClientSession, ca: str) -> dict:
     """Fetch token pair data from DexScreener and identify the pump timestamp."""
@@ -76,9 +87,6 @@ def parse_pump_timestamp(data: dict) -> tuple[datetime, datetime]:
 
 # ── Step 2: Scrape X for early tweets mentioning the CA ─────────────────
 
-COOKIES_FILE = "cookies.json"
-
-
 async def get_twikit_client() -> Client:
     """
     Authenticate with X via twikit.
@@ -87,8 +95,7 @@ async def get_twikit_client() -> Client:
       1. Load existing cookies.json (no login needed).
       2. Log in with env vars X_USERNAME, X_EMAIL, X_PASSWORD and save cookies.
 
-    If login fails (e.g. "Couldn't get KEY_BYTE indices"), you can bootstrap
-    cookies manually — see the setup-cookies sub-command.
+    If login fails, use 'setup-cookies' to import cookies from your browser.
     """
     client = Client(language="en-US")
 
@@ -105,7 +112,7 @@ async def get_twikit_client() -> Client:
             "No cookies.json found and X credentials not set.\n"
             "Either:\n"
             "  1. Set env vars X_USERNAME, X_EMAIL, X_PASSWORD (in .env) and re-run\n"
-            "  2. Run: python solana_callers.py setup-cookies  (interactive login)\n"
+            "  2. Run: python solana_callers.py setup-cookies  (import browser cookies)\n"
         )
 
     print("[twikit] Logging in...")
@@ -118,35 +125,49 @@ async def get_twikit_client() -> Client:
     except Exception as exc:
         sys.exit(
             f"[twikit] Login failed: {exc}\n\n"
-            "This often happens when X temporarily blocks login attempts.\n"
-            "Fix: run 'python solana_callers.py setup-cookies' to log in interactively,\n"
-            "or wait a while and retry."
+            "X is blocking programmatic login. Import browser cookies instead:\n"
+            "  python solana_callers.py setup-cookies\n\n"
+            + BROWSER_COOKIE_HELP
         )
     client.save_cookies(COOKIES_FILE)
     print("[twikit] Login successful, cookies saved.")
     return client
 
 
-async def interactive_login() -> None:
+def setup_cookies_interactive() -> None:
     """
-    Interactive cookie bootstrap — prompts for credentials, saves cookies.json.
-    Useful when automated login hits X's rate-limit / KEY_BYTE error.
+    Import cookies from the browser and write cookies.json for twikit.
+
+    Prompts for auth_token and ct0 (required), plus optional cookies.
     """
-    client = Client(language="en-US")
+    print("=" * 60)
+    print(" Import X (Twitter) cookies from your browser")
+    print("=" * 60)
+    print()
+    print(BROWSER_COOKIE_HELP)
 
-    username = input("X username: ").strip()
-    email = input("X email: ").strip()
-    password = input("X password: ").strip()
+    auth_token = input("auth_token (required): ").strip()
+    ct0 = input("ct0 (required):        ").strip()
 
-    print("[twikit] Attempting login...")
-    await client.login(
-        auth_info_1=username,
-        auth_info_2=email,
-        password=password,
-    )
-    client.save_cookies(COOKIES_FILE)
-    print(f"[twikit] Login successful — cookies saved to {COOKIES_FILE}")
-    print("You can now run the main script without re-authenticating.")
+    if not auth_token or not ct0:
+        sys.exit("auth_token and ct0 are both required.")
+
+    cookies = {
+        "auth_token": auth_token,
+        "ct0": ct0,
+    }
+
+    # Optional cookies
+    for name in ("kdt", "twid", "guest_id"):
+        val = input(f"{name} (optional, enter to skip): ").strip()
+        if val:
+            cookies[name] = val
+
+    with open(COOKIES_FILE, "w") as f:
+        json.dump(cookies, f, indent=2)
+
+    print(f"\nCookies saved to {COOKIES_FILE}")
+    print("You can now run: python solana_callers.py <CA>")
 
 
 def _parse_tweet_time(raw: str) -> datetime:
@@ -277,7 +298,7 @@ async def main() -> None:
     # Sub-command: setup-cookies
     subparsers.add_parser(
         "setup-cookies",
-        help="Interactively log in to X and save cookies.json",
+        help="Import browser cookies to cookies.json (bypasses login)",
     )
 
     # Default (positional) usage
@@ -287,7 +308,7 @@ async def main() -> None:
     args = parser.parse_args()
 
     if args.command == "setup-cookies":
-        await interactive_login()
+        setup_cookies_interactive()
         return
 
     if not args.ca:

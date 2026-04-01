@@ -22,15 +22,33 @@ pip install -r requirements.txt
 
 ## Setup
 
-On first run, twikit logs in with your credentials and saves a `cookies.json` file. Subsequent runs reuse the cookies automatically.
+You need an authenticated X session. There are two options:
 
-Set your credentials as environment variables before the first run:
+### Option A — Import browser cookies (recommended)
+
+This bypasses twikit's login flow, which X often blocks.
+
+1. Log in to [x.com](https://x.com) in your browser.
+2. Open DevTools (F12) → **Application** → **Cookies** → `https://x.com`
+3. Run the setup command and paste the cookie values when prompted:
 
 ```bash
-export X_USERNAME="your_username"
-export X_EMAIL="your_email@example.com"
-export X_PASSWORD="your_password"
+python solana_callers.py setup-cookies
 ```
+
+You'll need at minimum: `auth_token` and `ct0`.
+
+### Option B — Credentials via .env
+
+Create a `.env` file (see `.env.example`):
+
+```
+X_USERNAME="your_username"
+X_EMAIL="your_email@example.com"
+X_PASSWORD="your_password"
+```
+
+The script will attempt to log in via twikit and save `cookies.json`. If X blocks the login, fall back to Option A.
 
 ## Usage
 
