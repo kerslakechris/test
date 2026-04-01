@@ -34,7 +34,7 @@ Then run:
 
 # ── Twitter GraphQL search (direct, no twikit) ──────────────────────────
 
-TWITTER_SEARCH_URL = "https://x.com/i/api/graphql/MJpyQGqgklrVl_0X9gNy3A/SearchTimeline"
+TWITTER_SEARCH_URL = "https://x.com/i/api/graphql/flaR-PUMshxFWZWPNpq4zA/SearchTimeline"
 
 SEARCH_FEATURES = {
     "rweb_tipjar_consumption_enabled": True,
