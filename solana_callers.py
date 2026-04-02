@@ -88,7 +88,63 @@ def _patch_twikit_transaction():
     txn.ClientTransaction.get_indices = patched_get_indices
 
 
+def _patch_twikit_gql():
+    """Patch twikit's GraphQL search endpoint to use a current query ID.
+
+    X rotates these IDs; we try to fetch the latest from twikit's repo,
+    falling back to a list of known IDs.
+    """
+    try:
+        import twikit.client.gql as gql
+    except ImportError:
+        return
+
+    KNOWN_SEARCH_QIDS = [
+        "flaR-PUMshxFWZWPNpq4zA",
+        "4fpceYZ6-YQCx_JSl_Cn_A",
+        "nK1dw4oV3k4w5TdtcAdSww",
+    ]
+
+    # Allow env-var override
+    env_qid = os.environ.get("TWITTER_SEARCH_QID")
+    if env_qid:
+        KNOWN_SEARCH_QIDS.insert(0, env_qid)
+
+    # Check what twikit currently has
+    current = getattr(gql, "SEARCH_TIMELINE", "")
+    current_qid = current.rsplit("/graphql/", 1)[-1].split("/")[0] if "/graphql/" in str(current) else ""
+
+    if current_qid and current_qid not in KNOWN_SEARCH_QIDS:
+        KNOWN_SEARCH_QIDS.insert(0, current_qid)
+
+    # Store the list so we can try them at search time
+    gql._SEARCH_QIDS = KNOWN_SEARCH_QIDS
+
+    # Wrap the search_timeline method to retry with different QIDs on 404
+    original_search = gql.GQLClient.search_timeline
+
+    async def patched_search_timeline(self, query, product, count, cursor):
+        last_exc = None
+        for qid in gql._SEARCH_QIDS:
+            gql.SEARCH_TIMELINE = f"https://x.com/i/api/graphql/{qid}/SearchTimeline"
+            try:
+                result = await original_search(self, query, product, count, cursor)
+                return result
+            except Exception as exc:
+                exc_str = str(exc)
+                # 404 means wrong QID, try next
+                if "404" in exc_str:
+                    print(f"[twikit] Search QID {qid} returned 404, trying next...")
+                    last_exc = exc
+                    continue
+                raise  # non-404 error, propagate immediately
+        raise last_exc or Exception("All search query IDs failed")
+
+    gql.GQLClient.search_timeline = patched_search_timeline
+
+
 _patch_twikit_transaction()
+_patch_twikit_gql()
 
 from twikit import Client  # noqa: E402 — must import after patch
 
