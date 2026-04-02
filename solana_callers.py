@@ -58,11 +58,9 @@ def _patch_twikit_transaction():
     txn.INDICES_REGEX = re.compile(r"\[(\d+)\],\s*16")
 
     # Replace get_indices with fixed version
-    original_validate = txn.ClientTransaction.validate_response
-
     async def patched_get_indices(self, home_page_response, session, headers):
         key_byte_indices = []
-        response = original_validate(home_page_response) or self.home_page_response
+        response = self.validate_response(home_page_response) or self.home_page_response
         response_str = str(response)
 
         on_demand_match = txn.ON_DEMAND_FILE_REGEX.search(response_str)
