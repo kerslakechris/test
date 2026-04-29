@@ -293,46 +293,75 @@ async def scrape_tweets(
     max_tweets: int = 200,
 ) -> list[dict]:
     """Search X for tweets containing the CA within the time window."""
-    since_str = window_start.strftime("%Y-%m-%d")
-    until_str = (window_end + timedelta(days=1)).strftime("%Y-%m-%d")
-    query = f"{ca} since:{since_str} until:{until_str}"
+    # Don't use since:/until: in the query — they're unreliable for older tweets.
+    # We filter by timestamp after collecting results instead.
+    query = ca
 
     print(f"\nSearching X: {query}")
+    print(f"Time window: {window_start.isoformat()} → {window_end.isoformat()}")
 
-    tweets: list[dict] = []
-    try:
-        results = await client.search_tweet(query, product="Latest", count=20)
+    all_tweets: list[dict] = []
+    seen_ids = set()
 
-        while results and len(tweets) < max_tweets:
-            for tweet in results:
-                tweet_time = _parse_tweet_time(tweet.created_at)
+    # Try both Latest and Top products — Latest gives recency, Top gives popular
+    for product in ("Latest", "Top"):
+        print(f"\n[twikit] Searching ({product})...")
+        try:
+            results = await client.search_tweet(query, product=product, count=20)
 
-                if tweet_time < window_start or tweet_time > window_end:
-                    continue
+            page = 0
+            while results and len(all_tweets) < max_tweets and page < 10:
+                for tweet in results:
+                    if tweet.id in seen_ids:
+                        continue
+                    seen_ids.add(tweet.id)
 
-                tweets.append({
-                    "username": tweet.user.screen_name,
-                    "followers": tweet.user.followers_count,
-                    "tweet_time": tweet_time.isoformat(),
-                    "tweet_time_dt": tweet_time,
-                    "likes": tweet.favorite_count,
-                    "retweets": tweet.retweet_count,
-                    "tweet_url": f"https://x.com/{tweet.user.screen_name}/status/{tweet.id}",
-                })
+                    tweet_time = _parse_tweet_time(tweet.created_at)
+                    all_tweets.append({
+                        "username": tweet.user.screen_name,
+                        "followers": tweet.user.followers_count,
+                        "tweet_time": tweet_time.isoformat(),
+                        "tweet_time_dt": tweet_time,
+                        "likes": tweet.favorite_count,
+                        "retweets": tweet.retweet_count,
+                        "tweet_url": f"https://x.com/{tweet.user.screen_name}/status/{tweet.id}",
+                    })
 
-            if len(tweets) >= max_tweets:
-                break
-            try:
-                await asyncio.sleep(1)
-                results = await results.next()
-            except Exception:
-                break
+                page += 1
+                if len(all_tweets) >= max_tweets:
+                    break
+                try:
+                    await asyncio.sleep(1)
+                    results = await results.next()
+                except Exception:
+                    break
 
-    except Exception as exc:
-        print(f"[twikit] Error during search: {exc}")
+        except Exception as exc:
+            print(f"[twikit] Error during {product} search: {exc}")
 
-    print(f"Collected {len(tweets)} tweets in window.")
-    return tweets
+    print(f"\n[twikit] Total raw tweets collected: {len(all_tweets)}")
+
+    if all_tweets:
+        # Show date range of returned tweets so user can see if X is returning anything relevant
+        timestamps = sorted(t["tweet_time_dt"] for t in all_tweets)
+        print(f"[twikit] Tweet date range: {timestamps[0].isoformat()} → {timestamps[-1].isoformat()}")
+
+    filtered = [
+        t for t in all_tweets
+        if window_start <= t["tweet_time_dt"] <= window_end
+    ]
+    print(f"[twikit] Tweets in target window: {len(filtered)}")
+
+    if all_tweets and not filtered:
+        print(
+            "\n[!] X returned tweets, but none fall inside the pump window.\n"
+            "    This usually means X's search index doesn't cover the pump\n"
+            "    timeframe (it tends to drop older tweets).\n"
+            "    Saving all returned tweets to CSV anyway for inspection."
+        )
+        return all_tweets
+
+    return filtered
 
 
 # ── Step 3: Score callers ────────────────────────────────────────────────
@@ -341,16 +370,21 @@ def score_and_rank(tweets: list[dict], peak: datetime) -> list[dict]:
     """
     Score = (followers * 0.4) + (likes * 0.4) + (retweets * 0.2)
     Only tweets posted *before* the peak volume time are included.
+    Falls back to all tweets if none are pre-peak (e.g. X dropped older results).
     """
     pre_peak = [t for t in tweets if t["tweet_time_dt"] <= peak]
+    scored = pre_peak if pre_peak else tweets
 
-    for t in pre_peak:
+    if not pre_peak and tweets:
+        print("[!] No pre-peak tweets found; ranking all returned tweets instead.")
+
+    for t in scored:
         t["score"] = round(
             (t["followers"] * 0.4) + (t["likes"] * 0.4) + (t["retweets"] * 0.2), 2
         )
 
-    pre_peak.sort(key=lambda t: t["score"], reverse=True)
-    return pre_peak
+    scored.sort(key=lambda t: t["score"], reverse=True)
+    return scored
 
 
 # ── Step 4: Output ───────────────────────────────────────────────────────
