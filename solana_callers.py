@@ -151,24 +151,35 @@ from twikit import Client  # noqa: E402 — must import after patch
 
 # ── Step 1: Get pump timestamp from DexScreener ─────────────────────────
 
-async def fetch_dexscreener_data(session: aiohttp.ClientSession, ca: str) -> dict:
-    """Fetch token pair data from DexScreener and identify the pump timestamp."""
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
-    for attempt in range(4):
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status == 429:
-                    wait = 2 ** (attempt + 1)
-                    print(f"[DexScreener] Rate-limited, retrying in {wait}s...")
-                    await asyncio.sleep(wait)
-                    continue
-                resp.raise_for_status()
-                return await resp.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            wait = 2 ** (attempt + 1)
-            print(f"[DexScreener] Request error ({exc}), retrying in {wait}s...")
-            await asyncio.sleep(wait)
-    sys.exit("Failed to fetch DexScreener data after retries.")
+async def fetch_dexscreener_data(session: aiohttp.ClientSession, ca: str) -> dict | None:
+    """Fetch token pair data from DexScreener. Returns None if token not found."""
+    urls = [
+        f"https://api.dexscreener.com/latest/dex/tokens/{ca}",
+        f"https://api.dexscreener.com/token-pairs/v1/solana/{ca}",
+    ]
+    for url in urls:
+        for attempt in range(4):
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 429:
+                        wait = 2 ** (attempt + 1)
+                        print(f"[DexScreener] Rate-limited, retrying in {wait}s...")
+                        await asyncio.sleep(wait)
+                        continue
+                    if resp.status == 404:
+                        break  # try next URL
+                    resp.raise_for_status()
+                    data = await resp.json()
+                    pairs = data.get("pairs") or data if isinstance(data, list) else []
+                    if isinstance(data, dict):
+                        pairs = data.get("pairs") or []
+                    if pairs:
+                        return {"pairs": pairs if isinstance(pairs, list) else []}
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                wait = 2 ** (attempt + 1)
+                print(f"[DexScreener] Request error ({exc}), retrying in {wait}s...")
+                await asyncio.sleep(wait)
+    return None
 
 
 def parse_pump_timestamp(data: dict) -> tuple[datetime, datetime]:
@@ -182,7 +193,7 @@ def parse_pump_timestamp(data: dict) -> tuple[datetime, datetime]:
     """
     pairs = data.get("pairs") or []
     if not pairs:
-        sys.exit("No pairs found on DexScreener for this CA.")
+        return None, None
 
     pair = max(pairs, key=lambda p: float(p.get("volume", {}).get("h24", 0) or 0))
 
@@ -432,20 +443,51 @@ async def main() -> None:
     parser.add_argument("ca", help="Solana token contract address")
     parser.add_argument("-o", "--output", default="callers.csv", help="Output CSV path (default: callers.csv)")
     parser.add_argument("--top", type=int, default=5, help="Number of top callers to print (default: 5)")
+    parser.add_argument(
+        "--pump-time",
+        help="Manual pump timestamp (ISO format, e.g. 2026-03-23T01:39:00Z). "
+             "Use when DexScreener no longer has the token.",
+    )
     args = parser.parse_args()
 
     ca: str = args.ca
+    created_at = None
+    pump_peak = None
 
-    # Step 1 — DexScreener
-    async with aiohttp.ClientSession() as session:
-        dex_data = await fetch_dexscreener_data(session, ca)
+    # Step 1 — Get pump timestamp
+    if args.pump_time:
+        # Manual override
+        try:
+            created_at = datetime.fromisoformat(args.pump_time.replace("Z", "+00:00"))
+        except ValueError:
+            parser.error(f"Invalid --pump-time format: {args.pump_time}")
+        pump_peak = created_at + timedelta(minutes=15)
+        print(f"Using manual pump time: {created_at.isoformat()}")
+        print(f"Est. peak:             {pump_peak.isoformat()}")
+    else:
+        async with aiohttp.ClientSession() as session:
+            dex_data = await fetch_dexscreener_data(session, ca)
 
-    created_at, pump_peak = parse_pump_timestamp(dex_data)
+        if dex_data:
+            created_at, pump_peak = parse_pump_timestamp(dex_data)
+
+        if created_at is None:
+            print(
+                "\n[!] Token not found on DexScreener (may have been delisted).\n"
+                "    Re-run with --pump-time to set the pump timestamp manually:\n"
+                f"    python solana_callers.py {ca} --pump-time 2026-03-23T01:39:00Z\n"
+                "\n    Or omit it to search X for all tweets mentioning this CA.\n"
+            )
 
     # Step 2 — Scrape X
     client = await get_twikit_client()
-    window_start = created_at - timedelta(hours=1)
-    window_end = pump_peak + timedelta(minutes=30)
+    if created_at and pump_peak:
+        window_start = created_at - timedelta(hours=1)
+        window_end = pump_peak + timedelta(minutes=30)
+    else:
+        # No pump timestamp — search without a time window
+        window_start = datetime.min.replace(tzinfo=timezone.utc)
+        window_end = datetime.now(tz=timezone.utc)
     tweets = await scrape_tweets(client, ca, window_start, window_end)
 
     if not tweets:
@@ -453,7 +495,7 @@ async def main() -> None:
         return
 
     # Step 3 — Score
-    ranked = score_and_rank(tweets, pump_peak)
+    ranked = score_and_rank(tweets, pump_peak or datetime.now(tz=timezone.utc))
 
     # Step 4 — Output
     save_csv(ranked, args.output)
