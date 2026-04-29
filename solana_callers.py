@@ -170,11 +170,14 @@ async def fetch_dexscreener_data(session: aiohttp.ClientSession, ca: str) -> dic
                         break  # try next URL
                     resp.raise_for_status()
                     data = await resp.json()
-                    pairs = data.get("pairs") or data if isinstance(data, list) else []
-                    if isinstance(data, dict):
+                    if isinstance(data, list):
+                        pairs = data
+                    elif isinstance(data, dict):
                         pairs = data.get("pairs") or []
+                    else:
+                        pairs = []
                     if pairs:
-                        return {"pairs": pairs if isinstance(pairs, list) else []}
+                        return {"pairs": pairs}
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 wait = 2 ** (attempt + 1)
                 print(f"[DexScreener] Request error ({exc}), retrying in {wait}s...")
