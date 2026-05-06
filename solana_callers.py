@@ -432,6 +432,127 @@ def print_top(rows: list[dict], n: int = 5) -> None:
     print()
 
 
+# ── Step 5: Watchlist ────────────────────────────────────────────────────
+
+WATCHLIST_FILE = "watchlist.json"
+
+
+def load_watchlist() -> dict:
+    if Path(WATCHLIST_FILE).exists():
+        with open(WATCHLIST_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_watchlist(watchlist: dict) -> None:
+    with open(WATCHLIST_FILE, "w") as f:
+        json.dump(watchlist, f, indent=2)
+
+
+def update_watchlist(ranked: list[dict], ca: str) -> dict:
+    """
+    Merge scored tweets into the persistent watchlist.
+
+    Watchlist structure per username:
+    {
+      "tokens_called": 3,
+      "total_score": 1234.5,
+      "avg_score": 411.5,
+      "first_seen": "2026-03-23T01:30:00+00:00",
+      "last_seen": "2026-04-15T12:00:00+00:00",
+      "calls": [
+        {
+          "ca": "49bgr...",
+          "tweet_time": "...",
+          "tweet_url": "...",
+          "score": 400.2,
+          "followers": 5000,
+          "likes": 10,
+          "retweets": 2
+        }
+      ]
+    }
+    """
+    watchlist = load_watchlist()
+    now = datetime.now(tz=timezone.utc).isoformat()
+
+    for tweet in ranked:
+        username = tweet["username"]
+        entry = watchlist.get(username, {
+            "tokens_called": 0,
+            "total_score": 0,
+            "avg_score": 0,
+            "first_seen": tweet["tweet_time"],
+            "last_seen": tweet["tweet_time"],
+            "calls": [],
+        })
+
+        # Skip if this exact tweet was already recorded
+        existing_urls = {c["tweet_url"] for c in entry["calls"]}
+        if tweet["tweet_url"] in existing_urls:
+            watchlist[username] = entry
+            continue
+
+        # Check if this is a new token for this caller
+        existing_cas = {c["ca"] for c in entry["calls"]}
+        if ca not in existing_cas:
+            entry["tokens_called"] += 1
+
+        entry["calls"].append({
+            "ca": ca,
+            "tweet_time": tweet["tweet_time"],
+            "tweet_url": tweet["tweet_url"],
+            "score": tweet.get("score", 0),
+            "followers": tweet["followers"],
+            "likes": tweet["likes"],
+            "retweets": tweet["retweets"],
+        })
+
+        entry["total_score"] = round(
+            sum(c["score"] for c in entry["calls"]), 2
+        )
+        entry["avg_score"] = round(
+            entry["total_score"] / len(entry["calls"]), 2
+        )
+
+        # Update first/last seen
+        tweet_ts = tweet["tweet_time"]
+        if tweet_ts < entry["first_seen"]:
+            entry["first_seen"] = tweet_ts
+        if tweet_ts > entry["last_seen"]:
+            entry["last_seen"] = tweet_ts
+
+        watchlist[username] = entry
+
+    save_watchlist(watchlist)
+    return watchlist
+
+
+def print_watchlist_summary(watchlist: dict, n: int = 10) -> None:
+    if not watchlist:
+        return
+
+    # Rank by total tokens called, then avg score
+    ranked = sorted(
+        watchlist.items(),
+        key=lambda kv: (kv[1]["tokens_called"], kv[1]["avg_score"]),
+        reverse=True,
+    )
+
+    print(f"\n{'=' * 80}")
+    print(f" Watchlist — Top {min(n, len(ranked))} Repeat Callers")
+    print(f"{'=' * 80}")
+    for i, (username, data) in enumerate(ranked[:n], 1):
+        print(
+            f" {i}. @{username:<20} "
+            f"tokens={data['tokens_called']:<4} "
+            f"avg_score={data['avg_score']:<10} "
+            f"total_score={data['total_score']:<10} "
+            f"calls={len(data['calls'])}"
+        )
+    print()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -503,6 +624,11 @@ async def main() -> None:
     # Step 4 — Output
     save_csv(ranked, args.output)
     print_top(ranked, n=args.top)
+
+    # Step 5 — Update watchlist
+    watchlist = update_watchlist(ranked, ca)
+    print_watchlist_summary(watchlist)
+    print(f"Watchlist updated: {WATCHLIST_FILE}")
 
 
 if __name__ == "__main__":
