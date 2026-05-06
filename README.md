@@ -92,10 +92,20 @@ python solana_callers.py <CONTRACT_ADDRESS> [OPTIONS]
 
 | Argument | Description | Default |
 |---|---|---|
-| `ca` | Solana token contract address | required |
+| `ca` | Solana token contract address | required* |
 | `-o`, `--output` | CSV output file path | `callers.csv` |
 | `--top` | Number of top callers to print | `5` |
 | `--pump-time` | Manual pump timestamp (ISO 8601) | auto from DexScreener |
+| `--update-outcomes` | Update outcome data for watchlist calls | — |
+| `--user` | Only update outcomes for this username | all |
+| `--force` | Re-check all outcomes, not just pending | — |
+| `--batch-size` | Max outcome checks per run (0 = unlimited) | `0` |
+| `--watchlist` | Print watchlist and exit | — |
+| `--sort-by` | Sort watchlist: `tokens_called`, `win_rate`, `avg_multiple`, `total_score` | `tokens_called` |
+| `--min-calls` | Filter: minimum completed calls | `0` |
+| `--min-win-rate` | Filter: minimum win rate (0.0–1.0) | `0.0` |
+
+*Not required when using `--update-outcomes` or `--watchlist`.
 
 ### Commands
 
@@ -121,6 +131,18 @@ python solana_callers.py ACtfUWtgvaXrQGNMiohTusi5jcx5RJf5zwu9aAxkpump \
 python solana_callers.py <TOKEN_1>
 python solana_callers.py <TOKEN_2>
 python solana_callers.py <TOKEN_3>
+
+# Update outcomes for all pending calls
+python solana_callers.py --update-outcomes
+
+# Force re-check outcomes for a specific caller
+python solana_callers.py --update-outcomes --user alpha_caller --force
+
+# Batch update (useful for large watchlists)
+python solana_callers.py --update-outcomes --batch-size 50
+
+# View watchlist ranked by win rate, high performers only
+python solana_callers.py --watchlist --sort-by win_rate --min-calls 5 --min-win-rate 0.5
 ```
 
 ## Output
@@ -147,12 +169,12 @@ Searching X: ACtfUWtgvaXrQGNMiohTusi5jcx5RJf5zwu9aAxkpump
  4. @memecoin_alerts     followers=15200     likes=44    RTs=12    score=6100.0
  5. @pump_watcher        followers=4410      likes=3     RTs=0     score=1765.2
 
-================================================================================
- Watchlist — Top 5 Repeat Callers
-================================================================================
- 1. @alpha_caller        tokens=3   avg_score=28500.1   total_score=85500.3  calls=5
- 2. @degen_scout         tokens=2   avg_score=16200.0   total_score=32400.0  calls=2
- 3. @sol_sniper          tokens=2   avg_score=8800.5    total_score=17601.0  calls=3
+==========================================================================================
+ Watchlist — Top 5 Callers (sorted by win_rate)
+==========================================================================================
+ 1. @alpha_caller        tokens=3   WR=67%  avg=4.2x  (3 rated)
+ 2. @degen_scout         tokens=2   WR=50%  avg=3.1x  (2 rated)
+ 3. @sol_sniper          tokens=2   WR=50%  avg=2.8x  (2 rated)
 ```
 
 ### CSV (`callers.csv`)
@@ -175,8 +197,18 @@ Persists across every run. Per caller:
 {
   "alpha_caller": {
     "tokens_called": 3,
-    "total_score": 85500.3,
-    "avg_score": 28500.1,
+    "completed_calls": 3,
+    "pending_calls": 0,
+    "wins": 1,
+    "big_wins": 1,
+    "moonshots": 0,
+    "losses": 1,
+    "rugs": 0,
+    "win_rate": 0.6667,
+    "avg_multiple_24h": 4.2,
+    "median_multiple_24h": 3.8,
+    "best_call": { "ca": "ACtf...", "multiple": 8.2, "tweet_url": "..." },
+    "worst_call": { "ca": "49bg...", "multiple": 0.4, "tweet_url": "..." },
     "first_seen": "2026-03-20T14:22:00+00:00",
     "last_seen": "2026-04-01T09:15:00+00:00",
     "calls": [
@@ -187,7 +219,20 @@ Persists across every run. Per caller:
         "score": 33128.4,
         "followers": 82000,
         "likes": 312,
-        "retweets": 88
+        "retweets": 88,
+        "outcome": {
+          "status": "big_win",
+          "entry_price": 0.0000234,
+          "checked_at": "2026-03-24T01:40:00+00:00",
+          "windows": {
+            "15m":  { "multiple": 1.4, "drawdown": -0.12, "final": 0.0000287 },
+            "1h":   { "multiple": 2.1, "drawdown": -0.18, "final": 0.0000412 },
+            "6h":   { "multiple": 3.8, "drawdown": -0.18, "final": 0.0000356 },
+            "24h":  { "multiple": 8.2, "drawdown": -0.31, "final": 0.0000189 },
+            "7d":   { "multiple": 8.2, "drawdown": -0.78, "final": 0.0000051 }
+          },
+          "ath": { "multiple": 8.2, "minutes_to_ath": 187 }
+        }
       }
     ]
   }
@@ -195,6 +240,18 @@ Persists across every run. Per caller:
 ```
 
 The watchlist deduplicates by tweet URL, so re-running the same token is safe.
+
+### Outcome Labels
+
+| Label | Threshold |
+|---|---|
+| `moonshot` | Best 24h multiple >= 10x |
+| `big_win` | Best 24h multiple >= 5x |
+| `win` | Best 24h multiple >= 2x |
+| `loss` | Best 24h multiple < 1.5x |
+| `rug` | Multiple < 1x AND drawdown > 50% in 1h |
+| `pending` | Less than 24h since call |
+| `no_data` | No candle data available |
 
 ## Scoring Formula
 
@@ -220,21 +277,25 @@ Only tweets posted **before the estimated peak** are scored. If no pre-peak twee
 
 All optional. Set in `.env` or export in your shell.
 
-| Variable | Purpose |
-|---|---|
-| `X_USERNAME` | X username (login fallback) |
-| `X_EMAIL` | X email (login fallback) |
-| `X_PASSWORD` | X password (login fallback) |
-| `TWITTER_SEARCH_QID` | Override GraphQL search query ID when X rotates endpoints |
+| Variable | Purpose | Default |
+|---|---|---|
+| `X_USERNAME` | X username (login fallback) | — |
+| `X_EMAIL` | X email (login fallback) | — |
+| `X_PASSWORD` | X password (login fallback) | — |
+| `TWITTER_SEARCH_QID` | Override GraphQL search query ID when X rotates endpoints | — |
+| `OUTCOME_CHECK_ENABLED` | Auto-check outcomes after each CA lookup | `true` |
+| `OUTCOME_CHECK_DELAY_MIN` | Minutes to wait before checking a call's outcome | `60` |
+| `OUTCOME_CHECK_BACKOFF_HOURS` | Hours between re-checks for pending calls | `24` |
 
 ## Files
 
 | File | Tracked | Description |
 |---|---|---|
-| `solana_callers.py` | Yes | Main script |
+| `solana_callers.py` | Yes | Main script — CA lookup, scoring, watchlist |
+| `outcomes.py` | Yes | Outcome tracking — candle fetching, classification, aggregates |
 | `requirements.txt` | Yes | Python dependencies |
-| `.env.example` | Yes | Template for credentials |
+| `.env.example` | Yes | Template for credentials and config |
 | `.env` | No | Your credentials (gitignored) |
 | `cookies.json` | No | X session cookies (gitignored) |
-| `watchlist.json` | No | Persistent caller database (gitignored) |
+| `watchlist.json` | No | Persistent caller database with outcomes (gitignored) |
 | `callers.csv` | No | Output from last run |

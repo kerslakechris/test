@@ -148,6 +148,11 @@ _patch_twikit_gql()
 
 from twikit import Client  # noqa: E402 — must import after patch
 
+from outcomes import (  # noqa: E402
+    update_pending_outcomes,
+    recompute_caller_aggregates,
+)
+
 
 # ── Step 1: Get pump timestamp from DexScreener ─────────────────────────
 
@@ -528,28 +533,63 @@ def update_watchlist(ranked: list[dict], ca: str) -> dict:
     return watchlist
 
 
-def print_watchlist_summary(watchlist: dict, n: int = 10) -> None:
+def print_watchlist_summary(
+    watchlist: dict,
+    n: int = 10,
+    sort_by: str = "tokens_called",
+    min_calls: int = 0,
+    min_win_rate: float = 0.0,
+) -> None:
     if not watchlist:
         return
 
-    # Rank by total tokens called, then avg score
-    ranked = sorted(
-        watchlist.items(),
-        key=lambda kv: (kv[1]["tokens_called"], kv[1]["avg_score"]),
-        reverse=True,
-    )
+    items = list(watchlist.items())
 
-    print(f"\n{'=' * 80}")
-    print(f" Watchlist — Top {min(n, len(ranked))} Repeat Callers")
-    print(f"{'=' * 80}")
+    # Apply filters
+    if min_calls > 0:
+        items = [(u, d) for u, d in items if d.get("completed_calls", 0) >= min_calls]
+    if min_win_rate > 0:
+        items = [(u, d) for u, d in items if d.get("win_rate", 0) >= min_win_rate]
+
+    if not items:
+        print("\nNo callers match the filters.")
+        return
+
+    # Sort key
+    sort_keys = {
+        "tokens_called": lambda kv: (kv[1].get("tokens_called", 0), kv[1].get("avg_score", 0)),
+        "win_rate": lambda kv: (kv[1].get("win_rate", 0), kv[1].get("avg_multiple_24h", 0)),
+        "avg_multiple": lambda kv: kv[1].get("avg_multiple_24h", 0),
+        "total_score": lambda kv: kv[1].get("total_score", 0),
+    }
+    key_fn = sort_keys.get(sort_by, sort_keys["tokens_called"])
+    ranked = sorted(items, key=key_fn, reverse=True)
+
+    has_outcomes = any(d.get("completed_calls", 0) > 0 for _, d in ranked)
+
+    print(f"\n{'=' * 90}")
+    print(f" Watchlist — Top {min(n, len(ranked))} Callers (sorted by {sort_by})")
+    print(f"{'=' * 90}")
     for i, (username, data) in enumerate(ranked[:n], 1):
-        print(
+        line = (
             f" {i}. @{username:<20} "
-            f"tokens={data['tokens_called']:<4} "
-            f"avg_score={data['avg_score']:<10} "
-            f"total_score={data['total_score']:<10} "
-            f"calls={len(data['calls'])}"
+            f"tokens={data.get('tokens_called', 0):<4} "
         )
+        if has_outcomes:
+            wr = data.get("win_rate", 0)
+            avg_m = data.get("avg_multiple_24h", 0)
+            cc = data.get("completed_calls", 0)
+            line += (
+                f"WR={wr:.0%}  "
+                f"avg={avg_m:<6.1f}x "
+                f"({cc} rated) "
+            )
+        else:
+            line += (
+                f"avg_score={data.get('avg_score', 0):<10} "
+                f"calls={len(data.get('calls', []))}"
+            )
+        print(line)
     print()
 
 
@@ -564,7 +604,7 @@ async def main() -> None:
         description="Find influential X callers for a Solana token before its pump.",
         epilog="Run 'python solana_callers.py setup-cookies' to import browser cookies.",
     )
-    parser.add_argument("ca", help="Solana token contract address")
+    parser.add_argument("ca", nargs="?", help="Solana token contract address")
     parser.add_argument("-o", "--output", default="callers.csv", help="Output CSV path (default: callers.csv)")
     parser.add_argument("--top", type=int, default=5, help="Number of top callers to print (default: 5)")
     parser.add_argument(
@@ -572,7 +612,70 @@ async def main() -> None:
         help="Manual pump timestamp (ISO format, e.g. 2026-03-23T01:39:00Z). "
              "Use when DexScreener no longer has the token.",
     )
+
+    # Outcome tracking
+    parser.add_argument(
+        "--update-outcomes", action="store_true",
+        help="Update outcome data for pending calls in the watchlist",
+    )
+    parser.add_argument("--user", help="Only update outcomes for this username")
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Force re-check all outcomes, not just pending",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=0,
+        help="Max number of outcome checks per run (0 = unlimited)",
+    )
+
+    # Watchlist display
+    parser.add_argument("--watchlist", action="store_true", help="Print watchlist and exit")
+    parser.add_argument(
+        "--sort-by", default="tokens_called",
+        choices=["tokens_called", "win_rate", "avg_multiple", "total_score"],
+        help="Sort watchlist by this field (default: tokens_called)",
+    )
+    parser.add_argument("--min-calls", type=int, default=0, help="Filter: minimum completed calls")
+    parser.add_argument("--min-win-rate", type=float, default=0.0, help="Filter: minimum win rate (0.0-1.0)")
+
     args = parser.parse_args()
+
+    # ── Watchlist display mode ──
+    if args.watchlist:
+        watchlist = load_watchlist()
+        print_watchlist_summary(
+            watchlist, n=args.top * 2,
+            sort_by=args.sort_by,
+            min_calls=args.min_calls,
+            min_win_rate=args.min_win_rate,
+        )
+        return
+
+    # ── Standalone outcome update ──
+    if args.update_outcomes:
+        watchlist = load_watchlist()
+        if not watchlist:
+            print("Watchlist is empty. Run a CA lookup first.")
+            return
+        print("[*] Updating outcomes...")
+        watchlist = await update_pending_outcomes(
+            watchlist,
+            user_filter=args.user,
+            force=args.force,
+            batch_size=args.batch_size,
+        )
+        save_watchlist(watchlist)
+        print_watchlist_summary(
+            watchlist, sort_by="win_rate",
+            min_calls=args.min_calls,
+            min_win_rate=args.min_win_rate,
+        )
+        print(f"Watchlist saved: {WATCHLIST_FILE}")
+        return
+
+    # ── Normal CA lookup flow ──
+    if not args.ca:
+        parser.error("the following arguments are required: ca")
 
     ca: str = args.ca
     created_at = None
@@ -580,7 +683,6 @@ async def main() -> None:
 
     # Step 1 — Get pump timestamp
     if args.pump_time:
-        # Manual override
         try:
             created_at = datetime.fromisoformat(args.pump_time.replace("Z", "+00:00"))
         except ValueError:
@@ -609,7 +711,6 @@ async def main() -> None:
         window_start = created_at - timedelta(hours=1)
         window_end = pump_peak + timedelta(minutes=30)
     else:
-        # No pump timestamp — search without a time window
         window_start = datetime.min.replace(tzinfo=timezone.utc)
         window_end = datetime.now(tz=timezone.utc)
     tweets = await scrape_tweets(client, ca, window_start, window_end)
@@ -627,7 +728,14 @@ async def main() -> None:
 
     # Step 5 — Update watchlist
     watchlist = update_watchlist(ranked, ca)
-    print_watchlist_summary(watchlist)
+
+    # Step 6 — Auto outcome check
+    if os.getenv("OUTCOME_CHECK_ENABLED", "true").lower() == "true":
+        print("[*] Checking outcomes for eligible calls...")
+        watchlist = await update_pending_outcomes(watchlist)
+        save_watchlist(watchlist)
+
+    print_watchlist_summary(watchlist, sort_by="win_rate")
     print(f"Watchlist updated: {WATCHLIST_FILE}")
 
 
