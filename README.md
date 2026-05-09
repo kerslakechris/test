@@ -40,6 +40,8 @@ pip install -r requirements.txt
 | `twikit` | X/Twitter scraping via GraphQL |
 | `aiohttp` | Async HTTP for DexScreener API |
 | `python-dotenv` | Load `.env` credentials |
+| `streamlit` | Web-based GUI |
+| `pandas` | Data tables in the GUI |
 
 ## Setup — X Authentication
 
@@ -83,6 +85,23 @@ X_PASSWORD="your_password"
 The script will attempt to log in and save `cookies.json` automatically. If X blocks the login (common), fall back to Option A.
 
 ## Usage
+
+### GUI (recommended)
+
+```bash
+streamlit run gui.py
+```
+
+Opens a web dashboard at `http://localhost:8501` with four tabs:
+
+| Tab | What it does |
+|---|---|
+| **Token Lookup** | Paste a CA, configure options, search — results shown in a sortable table |
+| **Watchlist** | Browse all tracked callers with sorting, filtering, and expandable per-caller details |
+| **Update Outcomes** | Check price performance for pending calls, view outcome breakdown |
+| **Settings** | Import browser cookies, view file status and .env config |
+
+### CLI
 
 ```bash
 python solana_callers.py <CONTRACT_ADDRESS> [OPTIONS]
@@ -293,6 +312,7 @@ All optional. Set in `.env` or export in your shell.
 |---|---|---|
 | `solana_callers.py` | Yes | Main script — CA lookup, scoring, watchlist |
 | `outcomes.py` | Yes | Outcome tracking — candle fetching, classification, aggregates |
+| `gui.py` | Yes | Streamlit web GUI |
 | `requirements.txt` | Yes | Python dependencies |
 | `.env.example` | Yes | Template for credentials and config |
 | `.env` | No | Your credentials (gitignored) |
