@@ -22,6 +22,7 @@ st.set_page_config(
 from solana_callers import (
     COOKIES_FILE,
     WATCHLIST_FILE,
+    add_pump_timing,
     fetch_dexscreener_data,
     get_twikit_client,
     load_watchlist,
@@ -127,6 +128,7 @@ with tab_lookup:
         async def do_search():
             created_at = None
             pump_peak = None
+            token_name = ""
 
             if pump_time_str:
                 try:
@@ -143,7 +145,9 @@ with tab_lookup:
                 async with aiohttp.ClientSession() as session:
                     dex_data = await fetch_dexscreener_data(session, ca)
                 if dex_data:
-                    created_at, pump_peak = parse_pump_timestamp(dex_data)
+                    created_at, pump_peak, token_name = parse_pump_timestamp(
+                        dex_data
+                    )
                 if created_at is None:
                     print(
                         "[!] Token not found on DexScreener. "
@@ -166,37 +170,49 @@ with tab_lookup:
             ranked = score_and_rank(
                 tweets, pump_peak or datetime.now(tz=timezone.utc)
             )
+            add_pump_timing(ranked, created_at, pump_peak)
             save_csv(ranked, output_file)
-            watchlist = update_watchlist(ranked, ca)
+            watchlist = update_watchlist(ranked, ca, token_name)
 
             if auto_outcomes:
                 print("\n[*] Checking outcomes for eligible calls...")
                 watchlist = await update_pending_outcomes(watchlist)
                 save_watchlist(watchlist)
 
-            return ranked
+            return {"ranked": ranked, "token_name": token_name}
 
         with st.status("Searching...", expanded=True) as status:
-            results, log = capture_async(do_search())
+            search_result, log = capture_async(do_search())
             st.code(log, language="text")
-            if results:
+            if search_result:
                 status.update(
-                    label=f"Found {len(results)} callers", state="complete"
+                    label=f"Found {len(search_result['ranked'])} callers",
+                    state="complete",
                 )
             else:
                 status.update(label="Search completed", state="error")
 
-        if results:
-            st.session_state["last_results"] = results
+        if search_result:
+            st.session_state["last_results"] = search_result["ranked"]
+            st.session_state["last_token_name"] = search_result.get(
+                "token_name", ""
+            )
 
     if "last_results" in st.session_state and st.session_state["last_results"]:
         results = st.session_state["last_results"]
+        token_name_display = st.session_state.get("last_token_name", "")
 
         st.divider()
-        st.subheader(f"Top {min(top_n, len(results))} Callers")
+        header = f"Top {min(top_n, len(results))} Callers"
+        if token_name_display:
+            header += f" — {token_name_display}"
+        st.subheader(header)
 
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Found", len(results))
+        if token_name_display:
+            m1.metric("Token", token_name_display)
+        else:
+            m1.metric("Total Found", len(results))
         m2.metric("Highest Score", f"{results[0]['score']:,.1f}")
         m3.metric("Top Followers", format_number(results[0]["followers"]))
         avg_score = sum(r["score"] for r in results) / len(results)
@@ -205,6 +221,7 @@ with tab_lookup:
         display_cols = [
             "username",
             "followers",
+            "pump_timing",
             "tweet_time",
             "likes",
             "retweets",
@@ -216,19 +233,22 @@ with tab_lookup:
         if "username" in df.columns:
             df["username"] = df["username"].apply(lambda x: f"@{x}")
 
+        col_config = {
+            "username": st.column_config.TextColumn("Caller", width="medium"),
+            "followers": st.column_config.NumberColumn("Followers", format="%d"),
+            "pump_timing": st.column_config.TextColumn("Timing"),
+            "tweet_time": st.column_config.TextColumn("Tweet Time"),
+            "likes": st.column_config.NumberColumn("Likes"),
+            "retweets": st.column_config.NumberColumn("RTs"),
+            "score": st.column_config.NumberColumn("Score", format="%.1f"),
+            "tweet_url": st.column_config.LinkColumn("Tweet", display_text="View"),
+        }
+
         st.dataframe(
             df,
             use_container_width=True,
             hide_index=True,
-            column_config={
-                "username": st.column_config.TextColumn("Caller", width="medium"),
-                "followers": st.column_config.NumberColumn("Followers", format="%d"),
-                "tweet_time": st.column_config.TextColumn("Tweet Time"),
-                "likes": st.column_config.NumberColumn("Likes"),
-                "retweets": st.column_config.NumberColumn("RTs"),
-                "score": st.column_config.NumberColumn("Score", format="%.1f"),
-                "tweet_url": st.column_config.LinkColumn("Tweet", display_text="View"),
-            },
+            column_config=col_config,
         )
 
 
@@ -403,9 +423,12 @@ with tab_watchlist:
                             )
                             ath = outcome.get("ath", {}).get("multiple")
                             entry_p = outcome.get("entry_price")
+                            tname = c.get("token_name", "")
+                            ca_short = c.get("ca", "")[:12] + "..."
                             call_rows.append(
                                 {
-                                    "CA": c.get("ca", "")[:16] + "...",
+                                    "Token": tname if tname else ca_short,
+                                    "Timing": c.get("pump_timing", ""),
                                     "Tweet Time": c.get("tweet_time", "")[
                                         :19
                                     ],

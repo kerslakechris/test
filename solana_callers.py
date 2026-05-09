@@ -190,18 +190,13 @@ async def fetch_dexscreener_data(session: aiohttp.ClientSession, ca: str) -> dic
     return None
 
 
-def parse_pump_timestamp(data: dict) -> tuple[datetime, datetime]:
+def parse_pump_timestamp(data: dict) -> tuple[datetime, datetime, str]:
     """
-    Return (pair_created_at, estimated_pump_peak) from DexScreener response.
-
-    Heuristic: the first major volume spike typically happens within the first
-    few minutes after pair creation on Solana meme-token launches.  We use
-    pair creation time as the pump start and add 15 minutes as an estimate for
-    peak volume (conservative default).
+    Return (pair_created_at, estimated_pump_peak, token_name) from DexScreener.
     """
     pairs = data.get("pairs") or []
     if not pairs:
-        return None, None
+        return None, None, ""
 
     pair = max(pairs, key=lambda p: float(p.get("volume", {}).get("h24", 0) or 0))
 
@@ -212,11 +207,15 @@ def parse_pump_timestamp(data: dict) -> tuple[datetime, datetime]:
     created_at = datetime.fromtimestamp(created_ms / 1000, tz=timezone.utc)
     pump_peak = created_at + timedelta(minutes=15)
 
-    print(f"Pair:          {pair.get('baseToken', {}).get('symbol', '?')}/{pair.get('quoteToken', {}).get('symbol', '?')}")
+    base = pair.get("baseToken", {}).get("symbol", "?")
+    quote = pair.get("quoteToken", {}).get("symbol", "?")
+    token_name = f"{base}/{quote}"
+
+    print(f"Pair:          {token_name}")
     print(f"DEX:           {pair.get('dexId', '?')}")
     print(f"Created at:    {created_at.isoformat()}")
     print(f"Est. peak:     {pump_peak.isoformat()}")
-    return created_at, pump_peak
+    return created_at, pump_peak, token_name
 
 
 # ── Step 2: Scrape X for early tweets mentioning the CA ─────────────────
@@ -406,9 +405,40 @@ def score_and_rank(tweets: list[dict], peak: datetime) -> list[dict]:
     return scored
 
 
+def add_pump_timing(
+    tweets: list[dict],
+    created_at: datetime | None,
+    pump_peak: datetime | None,
+) -> list[dict]:
+    """Tag each tweet with its timing relative to the pump."""
+    if not created_at or not pump_peak:
+        for t in tweets:
+            t["pump_timing"] = ""
+        return tweets
+
+    for t in tweets:
+        dt = t["tweet_time_dt"]
+        minutes = int((dt - created_at).total_seconds() / 60)
+        sign = "+" if minutes >= 0 else ""
+
+        if dt < created_at:
+            label = "PRE-PUMP"
+        elif dt <= pump_peak:
+            label = "DURING"
+        else:
+            label = "AFTER"
+
+        t["pump_timing"] = f"{label} ({sign}{minutes}m)"
+
+    return tweets
+
+
 # ── Step 4: Output ───────────────────────────────────────────────────────
 
-CSV_COLUMNS = ["username", "followers", "tweet_time", "likes", "retweets", "score", "tweet_url"]
+CSV_COLUMNS = [
+    "username", "followers", "tweet_time", "likes", "retweets",
+    "score", "pump_timing", "tweet_url",
+]
 
 
 def save_csv(rows: list[dict], path: str) -> None:
@@ -424,12 +454,14 @@ def print_top(rows: list[dict], n: int = 5) -> None:
     print(f" Top {n} Influential Callers")
     print(f"{'=' * 80}")
     for i, r in enumerate(rows[:n], 1):
+        timing = r.get("pump_timing", "")
         print(
             f" {i}. @{r['username']:<20} "
             f"followers={r['followers']:<10} "
             f"likes={r['likes']:<6} "
             f"RTs={r['retweets']:<6} "
-            f"score={r['score']:<12} "
+            f"score={r['score']:<10} "
+            f"{timing:<18} "
             f"{r['tweet_url']}"
         )
     if not rows:
@@ -454,7 +486,7 @@ def save_watchlist(watchlist: dict) -> None:
         json.dump(watchlist, f, indent=2)
 
 
-def update_watchlist(ranked: list[dict], ca: str) -> dict:
+def update_watchlist(ranked: list[dict], ca: str, token_name: str = "") -> dict:
     """
     Merge scored tweets into the persistent watchlist.
 
@@ -505,12 +537,14 @@ def update_watchlist(ranked: list[dict], ca: str) -> dict:
 
         entry["calls"].append({
             "ca": ca,
+            "token_name": token_name,
             "tweet_time": tweet["tweet_time"],
             "tweet_url": tweet["tweet_url"],
             "score": tweet.get("score", 0),
             "followers": tweet["followers"],
             "likes": tweet["likes"],
             "retweets": tweet["retweets"],
+            "pump_timing": tweet.get("pump_timing", ""),
         })
 
         entry["total_score"] = round(
@@ -680,6 +714,7 @@ async def main() -> None:
     ca: str = args.ca
     created_at = None
     pump_peak = None
+    token_name = ""
 
     # Step 1 — Get pump timestamp
     if args.pump_time:
@@ -695,7 +730,7 @@ async def main() -> None:
             dex_data = await fetch_dexscreener_data(session, ca)
 
         if dex_data:
-            created_at, pump_peak = parse_pump_timestamp(dex_data)
+            created_at, pump_peak, token_name = parse_pump_timestamp(dex_data)
 
         if created_at is None:
             print(
@@ -719,15 +754,19 @@ async def main() -> None:
         print("No tweets found. Exiting.")
         return
 
-    # Step 3 — Score
+    # Step 3 — Score & timing
     ranked = score_and_rank(tweets, pump_peak or datetime.now(tz=timezone.utc))
+    add_pump_timing(ranked, created_at, pump_peak)
+
+    if token_name:
+        print(f"Token:         {token_name}")
 
     # Step 4 — Output
     save_csv(ranked, args.output)
     print_top(ranked, n=args.top)
 
     # Step 5 — Update watchlist
-    watchlist = update_watchlist(ranked, ca)
+    watchlist = update_watchlist(ranked, ca, token_name)
 
     # Step 6 — Auto outcome check
     if os.getenv("OUTCOME_CHECK_ENABLED", "true").lower() == "true":
