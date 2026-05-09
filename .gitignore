@@ -1,3 +1,4 @@
 cookies.json
 .env
 watchlist.json
+__pycache__/
