@@ -1,0 +1,10 @@
+2026-05-15 04:46:41,074 | DEBUG | [Aw5SxKyY] Calling DexScreener pair lookup: https://api.dexscreener.com/latest/dex/tokens/Aw5SxKyYhXFdZj2BHCqs11UaV5ohwpFQjauB9jFhpump
+2026-05-15 04:46:41,254 | DEBUG | [Aw5SxKyY] Pair found: 4AKhvqWzJ2B4eWdFxyiYPGbfoCkLkkHMVbea18YpLLuM liquidity=129076.82
+2026-05-15 04:46:41,255 | DEBUG | [3jG3vjwb] Calling DexScreener pair lookup: https://api.dexscreener.com/latest/dex/tokens/3jG3vjwbEuQCR3YkJKtLmH41jqHx9n36BBW1Kznkpump
+2026-05-15 04:46:41,368 | DEBUG | [3jG3vjwb] Pair found: J6hybSEsywufv8frkQiwU3hKDU9fb3pwynCFSA14sxTu liquidity=21250.03
+2026-05-15 04:46:41,368 | DEBUG | [3KHMZhpt] Calling DexScreener pair lookup: https://api.dexscreener.com/latest/dex/tokens/3KHMZhpthXuiCcgfTv7vVu9PpEz64KAEURFwi6Lopump
+2026-05-15 04:46:41,488 | DEBUG | [3KHMZhpt] Pair found: BJt1j9BqcGGHLmFMmCwYvD5aapSEut1MvFCR64xmrAYV liquidity=555795.67
+2026-05-15 13:37:11,505 | DEBUG | [5UUH9RTD] Calling DexScreener pair lookup: https://api.dexscreener.com/latest/dex/tokens/5UUH9RTDiSpq6HKS6bp4NdU9PNJpXRXuiw6ShBTBhgH2
+2026-05-15 13:37:11,645 | DEBUG | [5UUH9RTD] Pair found: 4w2cysotX6czaUGmmWg13hDpY4QEMG2CzeKYEQyK9Ama liquidity=4113109.26
+2026-05-15 13:37:11,646 | DEBUG | [4w2cysot] Fetching candles from=1778549768000 to=1779154568000
+2026-05-15 13:37:11,742 | WARNING | [4w2cysot] Candle endpoint returned HTTP 403

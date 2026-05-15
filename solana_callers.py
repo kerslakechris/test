@@ -8,18 +8,18 @@ import argparse
 import asyncio
 import csv
 import json
-import os
 import re
 import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import aiohttp
-from dotenv import load_dotenv
 
-load_dotenv()
+from config import Config
 
-COOKIES_FILE = "cookies.json"
+Config.validate()
+
+COOKIES_FILE = Config.COOKIES_FILE
 
 BROWSER_COOKIE_HELP = """\
 To export cookies from your browser:
@@ -106,7 +106,7 @@ def _patch_twikit_gql():
     ]
 
     # Allow env-var override
-    env_qid = os.environ.get("TWITTER_SEARCH_QID")
+    env_qid = Config.TWITTER_SEARCH_QID
     if env_qid:
         KNOWN_SEARCH_QIDS.insert(0, env_qid)
 
@@ -149,6 +149,7 @@ _patch_twikit_gql()
 from twikit import Client  # noqa: E402 — must import after patch
 
 from outcomes import (  # noqa: E402
+    audit_watchlist,
     update_pending_outcomes,
     recompute_caller_aggregates,
 )
@@ -163,9 +164,11 @@ async def fetch_dexscreener_data(session: aiohttp.ClientSession, ca: str) -> dic
         f"https://api.dexscreener.com/token-pairs/v1/solana/{ca}",
     ]
     for url in urls:
-        for attempt in range(4):
+        for attempt in range(Config.API_RETRY_ATTEMPTS):
             try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=Config.HTTP_TIMEOUT_PAIR)
+                ) as resp:
                     if resp.status == 429:
                         wait = 2 ** (attempt + 1)
                         print(f"[DexScreener] Rate-limited, retrying in {wait}s...")
@@ -205,7 +208,7 @@ def parse_pump_timestamp(data: dict) -> tuple[datetime, datetime, str]:
         sys.exit("Pair creation time not available in DexScreener response.")
 
     created_at = datetime.fromtimestamp(created_ms / 1000, tz=timezone.utc)
-    pump_peak = created_at + timedelta(minutes=15)
+    pump_peak = created_at + timedelta(minutes=Config.PUMP_PEAK_OFFSET_MIN)
 
     base = pair.get("baseToken", {}).get("symbol", "?")
     quote = pair.get("quoteToken", {}).get("symbol", "?")
@@ -233,9 +236,9 @@ async def get_twikit_client() -> Client:
         print("[twikit] Loaded saved cookies.")
         return client
 
-    username = os.environ.get("X_USERNAME")
-    email = os.environ.get("X_EMAIL")
-    password = os.environ.get("X_PASSWORD")
+    username = Config.X_USERNAME
+    email = Config.X_EMAIL
+    password = Config.X_PASSWORD
     if not all([username, email, password]):
         sys.exit(
             "No cookies.json found and X credentials not set.\n"
@@ -308,7 +311,7 @@ async def scrape_tweets(
     ca: str,
     window_start: datetime,
     window_end: datetime,
-    max_tweets: int = 200,
+    max_tweets: int = Config.DEFAULT_TWEET_LIMIT,
 ) -> list[dict]:
     """Search X for tweets containing the CA within the time window."""
     # Don't use since:/until: in the query — they're unreliable for older tweets.
@@ -325,10 +328,12 @@ async def scrape_tweets(
     for product in ("Latest", "Top"):
         print(f"\n[twikit] Searching ({product})...")
         try:
-            results = await client.search_tweet(query, product=product, count=20)
+            results = await client.search_tweet(
+                query, product=product, count=Config.TWEETS_PER_PAGE
+            )
 
             page = 0
-            while results and len(all_tweets) < max_tweets and page < 10:
+            while results and len(all_tweets) < max_tweets and page < Config.MAX_SEARCH_PAGES:
                 for tweet in results:
                     if tweet.id in seen_ids:
                         continue
@@ -398,7 +403,10 @@ def score_and_rank(tweets: list[dict], peak: datetime) -> list[dict]:
 
     for t in scored:
         t["score"] = round(
-            (t["followers"] * 0.4) + (t["likes"] * 0.4) + (t["retweets"] * 0.2), 2
+            (t["followers"] * Config.WEIGHT_FOLLOWERS)
+            + (t["likes"] * Config.WEIGHT_LIKES)
+            + (t["retweets"] * Config.WEIGHT_RETWEETS),
+            2,
         )
 
     scored.sort(key=lambda t: t["score"], reverse=True)
@@ -471,7 +479,7 @@ def print_top(rows: list[dict], n: int = 5) -> None:
 
 # ── Step 5: Watchlist ────────────────────────────────────────────────────
 
-WATCHLIST_FILE = "watchlist.json"
+WATCHLIST_FILE = Config.WATCHLIST_FILE
 
 
 def load_watchlist() -> dict:
@@ -661,6 +669,10 @@ async def main() -> None:
         "--batch-size", type=int, default=0,
         help="Max number of outcome checks per run (0 = unlimited)",
     )
+    parser.add_argument(
+        "--audit-outcomes", action="store_true",
+        help="Print status distribution of all calls in watchlist and exit",
+    )
 
     # Watchlist display
     parser.add_argument("--watchlist", action="store_true", help="Print watchlist and exit")
@@ -683,6 +695,15 @@ async def main() -> None:
             min_calls=args.min_calls,
             min_win_rate=args.min_win_rate,
         )
+        return
+
+    # ── Audit mode ──
+    if args.audit_outcomes:
+        watchlist = load_watchlist()
+        if not watchlist:
+            print("Watchlist is empty.")
+            return
+        audit_watchlist(watchlist)
         return
 
     # ── Standalone outcome update ──
@@ -722,7 +743,7 @@ async def main() -> None:
             created_at = datetime.fromisoformat(args.pump_time.replace("Z", "+00:00"))
         except ValueError:
             parser.error(f"Invalid --pump-time format: {args.pump_time}")
-        pump_peak = created_at + timedelta(minutes=15)
+        pump_peak = created_at + timedelta(minutes=Config.PUMP_PEAK_OFFSET_MIN)
         print(f"Using manual pump time: {created_at.isoformat()}")
         print(f"Est. peak:             {pump_peak.isoformat()}")
     else:
@@ -743,8 +764,8 @@ async def main() -> None:
     # Step 2 — Scrape X
     client = await get_twikit_client()
     if created_at and pump_peak:
-        window_start = created_at - timedelta(hours=1)
-        window_end = pump_peak + timedelta(minutes=30)
+        window_start = created_at - timedelta(minutes=Config.DEFAULT_WINDOW_BEFORE_MIN)
+        window_end = pump_peak + timedelta(minutes=Config.DEFAULT_WINDOW_AFTER_MIN)
     else:
         window_start = datetime.min.replace(tzinfo=timezone.utc)
         window_end = datetime.now(tz=timezone.utc)
@@ -769,7 +790,7 @@ async def main() -> None:
     watchlist = update_watchlist(ranked, ca, token_name)
 
     # Step 6 — Auto outcome check
-    if os.getenv("OUTCOME_CHECK_ENABLED", "true").lower() == "true":
+    if Config.OUTCOME_CHECK_ENABLED:
         print("[*] Checking outcomes for eligible calls...")
         watchlist = await update_pending_outcomes(watchlist)
         save_watchlist(watchlist)

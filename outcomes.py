@@ -6,17 +6,23 @@ performance metrics (multiples, drawdowns, win/loss classification).
 """
 
 import asyncio
-import os
+import logging
 import statistics
+from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
 import aiohttp
 
-# ── Configuration ────────────────────────────────────────────────────────
+from config import Config
 
-OUTCOME_CHECK_DELAY_MIN = int(os.getenv("OUTCOME_CHECK_DELAY_MIN", "60"))
-OUTCOME_CHECK_BACKOFF_HOURS = int(os.getenv("OUTCOME_CHECK_BACKOFF_HOURS", "24"))
+logger = logging.getLogger("outcomes")
+_fh = logging.FileHandler(Config.OUTCOMES_LOG_FILE)
+_fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+logger.addHandler(_fh)
+logger.setLevel(getattr(logging, Config.LOG_LEVEL, logging.INFO))
+
+# ── API endpoints (implementation constants, not user-tunable) ────────────
 
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{ca}"
 DEXSCREENER_CANDLES_URL = (
@@ -33,35 +39,49 @@ WINDOWS = [
 ]
 
 
-# ── Pair resolution ─────────────────────────────────────────────────────
+# ── Pair resolution ──────────────────────────────────────────────────────
 
 async def fetch_pair_address(
     session: aiohttp.ClientSession, ca: str
 ) -> str | None:
     """Return the most-liquid DEX pair address for the token."""
+    short = ca[:8]
     url = DEXSCREENER_TOKEN_URL.format(ca=ca)
-    for attempt in range(4):
+    logger.debug(f"[{short}] Calling DexScreener pair lookup: {url}")
+    for attempt in range(Config.API_RETRY_ATTEMPTS):
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=Config.HTTP_TIMEOUT_PAIR)
+            ) as resp:
                 if resp.status == 429:
                     await asyncio.sleep(2 ** (attempt + 1))
                     continue
                 if resp.status != 200:
+                    logger.warning(
+                        f"[{short}] DexScreener pair lookup returned HTTP {resp.status}"
+                    )
                     return None
                 data = await resp.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.warning(
+                f"[{short}] DexScreener pair lookup error (attempt {attempt}): {exc}"
+            )
             await asyncio.sleep(2 ** (attempt + 1))
             continue
 
         pairs = data.get("pairs") or []
         if not pairs:
+            logger.warning(f"[{short}] DexScreener returned 0 pairs")
             return None
 
         best = max(
             pairs,
             key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0),
         )
-        return best.get("pairAddress")
+        pair_address = best.get("pairAddress")
+        liquidity = best.get("liquidity", {}).get("usd", 0)
+        logger.debug(f"[{short}] Pair found: {pair_address} liquidity={liquidity}")
+        return pair_address
 
     return None
 
@@ -75,36 +95,47 @@ async def fetch_candles(
     to_ts: int,
 ) -> list[dict]:
     """Fetch 1-minute candles from DexScreener. Returns sorted by time."""
+    short = pair_address[:8]
     url = DEXSCREENER_CANDLES_URL.format(
         pair_address=pair_address,
         from_ms=from_ts,
         to_ms=to_ts,
     )
-    for attempt in range(4):
+    logger.debug(f"[{short}] Fetching candles from={from_ts} to={to_ts}")
+    for attempt in range(Config.API_RETRY_ATTEMPTS):
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=Config.HTTP_TIMEOUT_CANDLES)
+            ) as resp:
                 if resp.status == 429:
                     wait = 2 ** (attempt + 1)
                     await asyncio.sleep(wait)
                     continue
                 if resp.status != 200:
+                    logger.warning(
+                        f"[{short}] Candle endpoint returned HTTP {resp.status}"
+                    )
                     return []
                 data = await resp.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.warning(f"[{short}] Candle fetch error (attempt {attempt}): {exc}")
             await asyncio.sleep(2 ** (attempt + 1))
             continue
 
         bars = data.get("bars", data) if isinstance(data, dict) else data
         if not isinstance(bars, list):
+            logger.warning(f"[{short}] Candle response not a list: {type(bars)}")
             return []
 
         bars.sort(key=lambda b: b.get("t", 0))
+        logger.debug(f"[{short}] Got {len(bars)} candles")
         return bars
 
+    logger.warning(f"[{short}] All candle fetch attempts exhausted")
     return []
 
 
-# ── Outcome computation ─────────────────────────────────────────────────
+# ── Outcome computation ──────────────────────────────────────────────────
 
 def _find_entry_price(candles: list[dict], tweet_ts_ms: int) -> Decimal | None:
     """Find entry price: close of the candle containing tweet_time,
@@ -177,7 +208,6 @@ def compute_outcome(candles: list[dict], tweet_time: datetime) -> dict:
 
         max_price = max(highs) if highs else entry_price
         min_price = min(lows) if lows else entry_price
-        # Clamp to avoid division issues
         min_price = max(min_price, Decimal("0"))
 
         multiple = float(max_price / entry_price) if entry_price > 0 else 1.0
@@ -200,7 +230,6 @@ def compute_outcome(candles: list[dict], tweet_time: datetime) -> dict:
     best_24h = windows_result.get("24h", {}).get("multiple", 1.0)
     drawdown_1h = windows_result.get("1h", {}).get("drawdown", 0.0)
 
-    # Determine if enough time has passed for classification
     hours_since = (now - tweet_time).total_seconds() / 3600
     if hours_since < 24 and "24h" not in windows_result:
         status = "pending"
@@ -221,13 +250,13 @@ def compute_outcome(candles: list[dict], tweet_time: datetime) -> dict:
 
 def classify_outcome(best_multiple_24h: float, drawdown_1h: float) -> str:
     """Classify a call based on best 24h multiple and 1h drawdown."""
-    if best_multiple_24h >= 10:
+    if best_multiple_24h >= Config.THRESHOLD_MOONSHOT:
         return "moonshot"
-    if best_multiple_24h >= 5:
+    if best_multiple_24h >= Config.THRESHOLD_BIG_WIN:
         return "big_win"
-    if best_multiple_24h >= 2:
+    if best_multiple_24h >= Config.THRESHOLD_WIN:
         return "win"
-    if best_multiple_24h < 1.0 and drawdown_1h < -0.50:
+    if best_multiple_24h < 1.0 and drawdown_1h < Config.THRESHOLD_RUG_DRAWDOWN:
         return "rug"
     return "loss"
 
@@ -240,18 +269,36 @@ async def update_call_outcome(
     ca: str,
 ) -> dict:
     """End-to-end: look up pair, fetch candles, compute outcome, return updated call."""
-    pair_address = await fetch_pair_address(session, ca)
-    if not pair_address:
-        call["outcome"] = {"status": "no_data"}
+    short = ca[:8]
+    logger.info(f"[{short}] START outcome check tweet_time={call.get('tweet_time', '?')}")
+    try:
+        pair_address = await fetch_pair_address(session, ca)
+        if not pair_address:
+            logger.warning(f"[{short}] FAIL step=pair_lookup reason=no_pair_found")
+            call["outcome"] = {"status": "no_data", "reason": "no_pair_found"}
+            return call
+
+        tweet_time = datetime.fromisoformat(call["tweet_time"])
+        from_ts = int(tweet_time.timestamp() * 1000)
+        to_ts = from_ts + int(
+            timedelta(days=Config.CANDLE_FETCH_DAYS).total_seconds() * 1000
+        )
+
+        candles = await fetch_candles(session, pair_address, from_ts, to_ts)
+        if not candles:
+            logger.warning(f"[{short}] FAIL step=fetch_candles reason=empty_response")
+
+        outcome = compute_outcome(candles, tweet_time)
+        call["outcome"] = outcome
+        logger.info(
+            f"[{short}] COMPLETE status={outcome.get('status')} "
+            f"mult_24h={outcome.get('windows', {}).get('24h', {}).get('multiple', 'n/a')}"
+        )
         return call
-
-    tweet_time = datetime.fromisoformat(call["tweet_time"])
-    from_ts = int(tweet_time.timestamp() * 1000)
-    to_ts = from_ts + int(timedelta(days=7).total_seconds() * 1000)
-
-    candles = await fetch_candles(session, pair_address, from_ts, to_ts)
-    call["outcome"] = compute_outcome(candles, tweet_time)
-    return call
+    except Exception as e:
+        logger.error(f"[{short}] Unexpected error in outcome check", exc_info=True)
+        call["outcome"] = {"status": "error", "reason": str(e)}
+        return call
 
 
 # ── Caller aggregates ────────────────────────────────────────────────────
@@ -338,6 +385,40 @@ def recompute_caller_aggregates(entry: dict) -> dict:
     return entry
 
 
+# ── Audit ────────────────────────────────────────────────────────────────
+
+_VALID_STATUSES = {"win", "big_win", "moonshot", "loss", "rug", "pending", "no_data", "error"}
+
+
+def audit_watchlist(watchlist: dict) -> None:
+    """Print status distribution of all calls and sample problem records."""
+    status_dist: dict[str, int] = defaultdict(int)
+    sample_problems: list[tuple] = []
+
+    for username, entry in watchlist.items():
+        for call in entry.get("calls", []):
+            outcome = call.get("outcome")
+            if outcome is None:
+                status_dist["NO_OUTCOME_FIELD"] += 1
+                if len(sample_problems) < 5:
+                    sample_problems.append(("no_outcome", username, call.get("ca")))
+            else:
+                s = outcome.get("status", "MISSING_STATUS")
+                status_dist[s] += 1
+                if len(sample_problems) < 10 and s not in _VALID_STATUSES:
+                    sample_problems.append((s, username, call.get("ca")))
+
+    total = sum(status_dist.values())
+    print(f"\n[audit] Total calls accounted for: {total}")
+    print(f"[audit] Status distribution: {dict(status_dist)}")
+    if sample_problems:
+        print("[audit] Sample problem records (status, username, ca):")
+        for rec in sample_problems:
+            print(f"         {rec}")
+    else:
+        print("[audit] No problem records found.")
+
+
 # ── Batch update ─────────────────────────────────────────────────────────
 
 async def update_pending_outcomes(
@@ -348,12 +429,13 @@ async def update_pending_outcomes(
 ) -> dict:
     """Update outcomes for eligible calls in the watchlist."""
     now = datetime.now(tz=timezone.utc)
-    delay = timedelta(minutes=OUTCOME_CHECK_DELAY_MIN)
-    backoff = timedelta(hours=OUTCOME_CHECK_BACKOFF_HOURS)
+    delay = timedelta(minutes=Config.OUTCOME_CHECK_DELAY_MIN)
+    backoff = timedelta(hours=Config.OUTCOME_CHECK_BACKOFF_HOURS)
 
     updated = 0
     skipped = 0
     total = 0
+    status_counts: dict[str, int] = defaultdict(int)
 
     async with aiohttp.ClientSession() as session:
         for username, entry in watchlist.items():
@@ -390,17 +472,22 @@ async def update_pending_outcomes(
                 print(f"  Checking @{username} → {ca[:12]}...")
                 await update_call_outcome(session, call, ca)
                 updated += 1
+                status_counts[call["outcome"].get("status", "null_status")] += 1
 
                 if batch_size and updated >= batch_size:
                     print(f"  Batch limit ({batch_size}) reached.")
                     break
 
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(Config.INTER_OUTCOME_SLEEP_S)
 
             recompute_caller_aggregates(entry)
 
             if batch_size and updated >= batch_size:
                 break
 
+    summary = dict(status_counts)
+    logger.info(f"BATCH SUMMARY: {summary}")
     print(f"\n[outcomes] {updated} updated, {skipped} skipped, {total} total calls")
+    if summary:
+        print(f"[outcomes] BATCH SUMMARY: {summary}")
     return watchlist

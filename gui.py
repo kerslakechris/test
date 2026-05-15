@@ -19,6 +19,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+from config import Config
 from solana_callers import (
     COOKIES_FILE,
     WATCHLIST_FILE,
@@ -116,7 +117,7 @@ with tab_lookup:
         )
         auto_outcomes = st.checkbox(
             "Auto-check outcomes after search",
-            value=os.getenv("OUTCOME_CHECK_ENABLED", "true").lower() == "true",
+            value=Config.OUTCOME_CHECK_ENABLED,
         )
 
     search_btn = st.button(
@@ -138,7 +139,7 @@ with tab_lookup:
                 except ValueError:
                     print(f"Invalid pump time format: {pump_time_str}")
                     return None
-                pump_peak = created_at + timedelta(minutes=15)
+                pump_peak = created_at + timedelta(minutes=Config.PUMP_PEAK_OFFSET_MIN)
                 print(f"Using manual pump time: {created_at.isoformat()}")
                 print(f"Est. peak:             {pump_peak.isoformat()}")
             else:
@@ -156,8 +157,8 @@ with tab_lookup:
 
             client = await get_twikit_client()
             if created_at and pump_peak:
-                window_start = created_at - timedelta(hours=1)
-                window_end = pump_peak + timedelta(minutes=30)
+                window_start = created_at - timedelta(minutes=Config.DEFAULT_WINDOW_BEFORE_MIN)
+                window_end = pump_peak + timedelta(minutes=Config.DEFAULT_WINDOW_AFTER_MIN)
             else:
                 window_start = datetime.min.replace(tzinfo=timezone.utc)
                 window_end = datetime.now(tz=timezone.utc)
@@ -551,10 +552,10 @@ with tab_outcomes:
             rugs = sum(d.get("rugs", 0) for d in watchlist_out.values())
 
             b1, b2, b3, b4, b5 = st.columns(5)
-            b1.metric("Moonshots (10x+)", moonshots)
-            b2.metric("Big Wins (5x+)", big_wins)
-            b3.metric("Wins (2x+)", wins)
-            b4.metric("Losses (<1.5x)", losses)
+            b1.metric(f"Moonshots ({Config.THRESHOLD_MOONSHOT:.0f}x+)", moonshots)
+            b2.metric(f"Big Wins ({Config.THRESHOLD_BIG_WIN:.0f}x+)", big_wins)
+            b3.metric(f"Wins ({Config.THRESHOLD_WIN:.0f}x+)", wins)
+            b4.metric("Losses", losses)
             b5.metric("Rugs", rugs)
 
 
